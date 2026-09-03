@@ -47,8 +47,10 @@ add_dataflow_scheduler_library(DataflowSchedulerTransforms
   LINK_MLIR_LIBS
     MLIRIR
     MLIRArithDialect
+    MLIRLinalgDialect
     MLIRMathDialect
     MLIRSCFDialect
+    MLIRTensorDialect
     MLIRPass
     MLIRTransformUtils
     MLIRValueBoundsOpInterface

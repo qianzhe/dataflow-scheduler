@@ -19,6 +19,9 @@
 #map_vars     = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
 
 module @local_schedule_1 {
+  ktdf_arch.device @test_device {
+    memory { kind = "IAB", ktdf_arch.features = { ktdf_arch.feature.indirect_address_buffer = { num_entries = 32 } } }
+  }
   func.func @iter_arg_threading(%arg5: index, %arg6: index, %arg7: index, %arg8: index)
       attributes {grid = [1 : index]} {
     %c0 = arith.constant 0 : index
@@ -38,7 +41,7 @@ module @local_schedule_1 {
     %tile = ktdp_lowering.construct_indirect_access_tile
         intermediate_variables(%arg5, %arg6, %arg7, %arg8)
         base_ptr = %iab_mv[%arg5, %arg6]
-        %desc_1[%c0, %arg7, %arg8]
+        %desc_1[(%c0), (%arg7), (%arg8)]
         {variables_space_order = #map_vars,
          variables_space_set = #set_vars}
         : memref<64x2x64xf16>, memref<2x32xindex, "IAB">

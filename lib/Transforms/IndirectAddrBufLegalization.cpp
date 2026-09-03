@@ -538,6 +538,87 @@ static mlir::LogicalResult propagateNarrowing(
   return mlir::success();
 }
 
+/// Collect all ops in `block` that must move into the window loop body.
+///
+/// The reachability set is seeded from `indirect_op` and grown by:
+///   UP:   follow def-use edges through operands whose type is narrowable
+///         (AccessTileType or RankedTensorType).  When an IAB memref operand
+///         is encountered, also include every other user of that memref
+///         (the IAB fill chain) and walk their operands upward.
+///   DOWN: follow def-use edges through users of `indirect_op`'s result,
+///         then UP from each user's non-indirect operands (pulls in the
+///         scatter source-data chain that is only reachable downstream).
+///
+/// Returns {splice_begin_op, splice_end_op}: the earliest
+/// ktdp.construct_access_tile and the latest ktdp.store in block order
+/// among the collected set.  Both are guaranteed to be non-null because
+/// the input MLIR is in the canonical "indirect_load + compute + store"
+/// form.
+static std::pair<mlir::Operation*, mlir::Operation*> findSpliceBoundary(
+    mlir::ktdp_lowering::ConstructIndirectAccessTileOp indirect_op) {
+  mlir::Block* block = indirect_op->getBlock();
+  llvm::DenseSet<mlir::Operation*> visited;
+  llvm::SmallVector<mlir::Operation*> worklist;
+
+  auto enqueue = [&](mlir::Operation* op) {
+    if (op && op->getBlock() == block && visited.insert(op).second)
+      worklist.push_back(op);
+  };
+
+  // Seed: the indirect op itself.
+  enqueue(indirect_op.getOperation());
+
+  // Walk the worklist; each item is processed for both UP and DOWN edges.
+  // We do a single unified worklist: for each visited op we push its
+  // defining-op (UP) and its users (DOWN) that live in the same block.
+  //
+  // Special case: when we encounter the IAB memref operand of indirect_op,
+  // we also enqueue all other users of that memref (the fill chain).
+  mlir::Value iab_memref = indirect_op.getIndAddrBufMemref();
+
+  while (!worklist.empty()) {
+    mlir::Operation* cur = worklist.pop_back_val();
+
+    // UP: walk operands.
+    for (mlir::Value operand : cur->getOperands()) {
+      // If this operand IS the IAB memref, include all its users (fill chain).
+      if (operand == iab_memref) {
+        for (mlir::OpOperand& use : iab_memref.getUses())
+          enqueue(use.getOwner());
+        continue;
+      }
+      // Otherwise follow narrowable operands (AccessTile / tensor) upward.
+      if (mlir::isa<mlir::ktdp::AccessTileType, mlir::RankedTensorType>(
+              operand.getType())) {
+        if (mlir::Operation* def = operand.getDefiningOp())
+          enqueue(def);
+      }
+    }
+
+    // DOWN: walk users of each result.
+    for (mlir::Value result : cur->getResults()) {
+      if (mlir::isa<mlir::ktdp::AccessTileType, mlir::RankedTensorType>(
+              result.getType())) {
+        for (mlir::OpOperand& use : result.getUses())
+          enqueue(use.getOwner());
+      }
+    }
+  }
+
+  // Scan the block in order to find the boundary ops.
+  mlir::Operation* splice_begin = nullptr;  // earliest construct_access_tile
+  mlir::Operation* splice_end = nullptr;    // latest ktdp.store
+  for (mlir::Operation& blk_op : *block) {
+    if (!visited.count(&blk_op)) continue;
+    if (mlir::isa<mlir::ktdp::ConstructAccessTilesOp>(&blk_op) &&
+        !splice_begin)
+      splice_begin = &blk_op;
+    if (mlir::isa<mlir::ktdp::StoreOp>(&blk_op))
+      splice_end = &blk_op;
+  }
+  return {splice_begin, splice_end};
+}
+
 /// Sub-step 2a: for one ConstructIndirectAccessTileOp, materialise all window
 /// scf.for loops (all IAB subscript dimensions except the innermost per-entry
 /// one), narrowing the IAB memref and updating the op on each iteration.
@@ -588,23 +669,30 @@ static mlir::LogicalResult materializeWindowLoops(
     int64_t N = *trip_count;
 
     // ── Step 2: determine splice boundary ────────────────────────────────
-    // Find the earliest op to move into the loop body.  For k == 0: the
-    // first ktdp.construct_access_tile that precedes current_op (covers both
-    // gather — no preceding source tile, falls back to current_op — and
-    // scatter — source tile precedes IAB fill).  For k > 0: current_op is
-    // already inside the k-1 loop body so we splice from the very first op.
+    // Derive the boundary from the def-use graph of current_op:
+    //   splice_begin_op — earliest ktdp.construct_access_tile reachable from
+    //                     current_op (via upstream operands, IAB memref
+    //                     use-list, and downstream users).
+    //   splice_end_op   — latest ktdp.store reachable by the same walk.
+    // For k > 0 current_op is already inside the k-1 loop body, so we splice
+    // from the very first op in that body.
     mlir::Block* src_block = current_op->getBlock();
-    mlir::Operation* splice_begin_op = current_op.getOperation();
+    mlir::Operation* splice_begin_op = nullptr;
+    mlir::Operation* splice_end_op = nullptr;
     if (k == 0) {
-      for (mlir::Operation& blk_op : *src_block) {
-        if (mlir::isa<mlir::ktdp::ConstructAccessTilesOp>(&blk_op)) {
-          splice_begin_op = &blk_op;
-          break;
-        }
-        if (&blk_op == current_op.getOperation()) break;
-      }
+      auto [begin, end] = findSpliceBoundary(current_op);
+      splice_begin_op = begin;
+      splice_end_op = end;
     } else {
       splice_begin_op = &src_block->front();
+      // For k > 0 splice the entire body up to (and including) the last op
+      // before the terminator.
+      splice_end_op = &*std::prev(src_block->without_terminator().end());
+    }
+    if (!splice_begin_op || !splice_end_op) {
+      current_op.emitError()
+          << "could not determine splice boundary for window loop " << k;
+      return mlir::failure();
     }
 
     // ── Step 3: emit scf.for BEFORE splice_begin_op ──────────────────────
@@ -628,11 +716,12 @@ static mlir::LogicalResult materializeWindowLoops(
 
     mlir::Block* dst_block = for_op.getBody();
 
-    // Splice [splice_begin_op, end-before-terminator) from src_block into
+    // Splice [splice_begin_op, splice_end_op] (inclusive) from src_block into
     // the for body.  for_op was inserted before splice_begin_op so it is
-    // not in this range.
+    // not in the range.  For k > 0 splice_end_op points to the last op before
+    // the terminator so std::next reaches the terminator — same as before.
     mlir::Block::iterator splice_begin = splice_begin_op->getIterator();
-    auto splice_end = src_block->without_terminator().end();
+    mlir::Block::iterator splice_end = std::next(splice_end_op->getIterator());
     dst_block->getOperations().splice(dst_block->begin(),
                                       src_block->getOperations(),
                                       splice_begin, splice_end);

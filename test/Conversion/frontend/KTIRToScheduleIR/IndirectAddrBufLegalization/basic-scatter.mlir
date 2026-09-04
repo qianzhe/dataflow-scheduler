@@ -23,6 +23,10 @@
 // CHECK-SAME:        iterator_types = ["parallel", "parallel", "parallel"]
 // CHECK:           ktdp_lowering.construct_memory_view {{.*}} sizes: [32],
 // CHECK-SAME:        memory_space = "IAB"
+// CHECK:           ktdp.construct_access_tile {{.*}} -> !ktdp.access_tile<1x32xindex>
+// CHECK:           ktdp.load {{.*}} <1x32xindex> -> tensor<1x32xindex>
+// CHECK:           tensor.collapse_shape {{.*}} {{\[\[}}0, 1{{\]\]}}
+// CHECK-SAME:        tensor<1x32xindex> into tensor<32xindex>
 // CHECK:           ktdp_lowering.construct_indirect_access_tile
 // CHECK-SAME:        -> !ktdp.access_tile<32x2x64xindex>
 // CHECK:           ktdp.store {{.*}} tensor<32x2x64xf16>, <32x2x64xindex>

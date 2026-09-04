@@ -653,6 +653,10 @@ static mlir::LogicalResult materializeWindowLoops(
   // handle that always points to the live op.
   mlir::ktdp_lowering::ConstructIndirectAccessTileOp current_op = op;
 
+  // Accumulate the loop IVs emitted on each iteration so that prior IVs can
+  // be used as fixed subscripts in subsequent iterations.
+  llvm::SmallVector<mlir::Value> window_ivs;
+
   for (int64_t k = 0; k < W; ++k) {
     // ── Step 1: identify window variable w_k and trip count ──────────────
     // The window variable being absorbed is the one that drives the outermost
@@ -723,6 +727,7 @@ static mlir::LogicalResult materializeWindowLoops(
     auto parallel_attr = mlir::ktdf::LoopTypeAttr::get(
         ctx, mlir::ktdf::LoopType::ParallelLoop);
     for_op->setAttr("loop_type", parallel_attr);
+    window_ivs.push_back(for_op.getInductionVar());
 
     mlir::Block* dst_block = for_op.getBody();
 
@@ -920,15 +925,26 @@ static mlir::LogicalResult materializeWindowLoops(
       pre_narrowed.push_back(new_iab_at.getOperation());
 
       // For each store that uses iab_at, also narrow the data-source chain:
-      // store.data_tile → ktdp.load → ktdp.construct_access_tile (addr_buf_at).
-      // The addr_buf access tile is narrowed from [c0, c0] to [for_iv, c0].
+      // store.data_tile → (optional collapse_shape*) → ktdp.load
+      //                 → ktdp.construct_access_tile (addr_buf_at).
+      // On k=0 data_tile is directly a ktdp.load result.  On k>0 a prior
+      // window iteration has inserted tensor.collapse_shape between the load
+      // and the store; we walk through any such ops to reach the fill_load.
       for (mlir::OpOperand& at_use : iab_at.getResult().getUses()) {
         auto fill_store =
             mlir::dyn_cast<mlir::ktdp::StoreOp>(at_use.getOwner());
         if (!fill_store) continue;
         pre_narrowed.push_back(fill_store.getOperation());
 
+        // Walk through any collapse_shape chain inserted by prior iterations.
         mlir::Value data_val = fill_store.getDataTile();
+        llvm::SmallVector<mlir::tensor::CollapseShapeOp> prior_collapses;
+        while (auto collapse =
+                   mlir::dyn_cast_if_present<mlir::tensor::CollapseShapeOp>(
+                       data_val.getDefiningOp())) {
+          prior_collapses.push_back(collapse);
+          data_val = collapse.getSrc();
+        }
         auto fill_load = mlir::dyn_cast_if_present<mlir::ktdp::LoadOp>(
             data_val.getDefiningOp());
         if (!fill_load) continue;
@@ -938,33 +954,77 @@ static mlir::LogicalResult materializeWindowLoops(
                 fill_load.getAccessTile().getDefiningOp());
         if (!addr_buf_at) continue;
 
-        // Narrow addr_buf access tile: the absorbed window dimension is the
-        // leading dimension of the addr_buf memref (always dim 0 in the
-        // addr_buf tile), so we drop dim 0 from set/order/shape.
-        // subscript[0] becomes the loop IV (selects the current window row).
+        // Rebuild the addr_buf access tile keeping the full base-memref rank.
+        // The window dimension (dim 0) is NOT dropped from the set/order/shape.
+        // Instead we pin dim 0 to exactly 1 element by replacing the old upper
+        // bound constraint (-d0 + N-1 >= 0) with (-d0 >= 0), giving shape [1,
+        // 32, ...].  This satisfies the ConstructAccessTilesOp invariant
+        // (access_tile_set.numDims == base_map.numInputs == memref rank == 2)
+        // without changing the op's verifier.
+        //
+        // On iteration k, dim k of the addr_buf tile is newly pinned to 1.
+        // Dims 0..k-1 were already pinned by prior iterations (shape = 1).
+        // The indices list has ab_num_dims entries: index k = loop IV, all
+        // others = %c0.  access_tile_set pins dim k by replacing its upper-
+        // bound constraint with -d_k >= 0.
+
+        mlir::IntegerSet old_ab_set =
+            addr_buf_at.getAccessTileSet().getValue();
+        unsigned ab_num_dims = old_ab_set.getNumDims();
+        unsigned pin_dim = static_cast<unsigned>(k);
+
+        // Build updated access_tile_set: replace the upper-bound inequality on
+        // dim k (-d_k + (N-1) >= 0) with -d_k >= 0, pinning dim k to [0,0].
+        // The lower-bound (d_k >= 0) is kept unchanged.
+        llvm::SmallVector<mlir::AffineExpr> new_ab_constraints;
+        llvm::SmallVector<bool> new_ab_eq_flags;
+        mlir::AffineExpr dk = mlir::getAffineDimExpr(pin_dim, ctx);
+        bool replaced_ub = false;
+        for (unsigned ci = 0; ci < old_ab_set.getNumConstraints(); ++ci) {
+          mlir::AffineExpr c = old_ab_set.getConstraint(ci);
+          bool is_eq = old_ab_set.isEq(ci);
+          // Detect the upper-bound on dim k: an inequality involving dim k
+          // that is not the bare lower-bound expression (d_k >= 0).
+          if (!is_eq && c.isFunctionOfDim(pin_dim) && !replaced_ub) {
+            if (c != dk) {
+              // Replace with -d_k >= 0.
+              new_ab_constraints.push_back(
+                  mlir::getAffineConstantExpr(0, ctx) - dk);
+              new_ab_eq_flags.push_back(false);
+              replaced_ub = true;
+              continue;
+            }
+          }
+          new_ab_constraints.push_back(c);
+          new_ab_eq_flags.push_back(is_eq);
+        }
+        mlir::IntegerSet new_ab_set = mlir::IntegerSet::get(
+            ab_num_dims, old_ab_set.getNumSymbols(),
+            new_ab_constraints, new_ab_eq_flags);
+
+        // access_tile_order and base_map keep the full base-memref rank.
+        mlir::AffineMap new_ab_order = addr_buf_at.getAccessTileOrder();
+        mlir::AffineMap new_ab_base_map =
+            mlir::AffineMap::getMultiDimIdentityMap(ab_num_dims, ctx);
+
+        // Result shape: dim k becomes 1 (pinned), others unchanged.
         auto old_ab_type = mlir::cast<mlir::ktdp::AccessTileType>(
             addr_buf_at.getResult().getType());
-        llvm::SmallVector<int64_t> new_ab_shape =
-            dropShapeDim(old_ab_type.getShape(), 0);
+        llvm::SmallVector<int64_t> new_ab_shape(old_ab_type.getShape().begin(),
+                                                old_ab_type.getShape().end());
+        new_ab_shape[pin_dim] = 1;
         auto new_ab_type = mlir::ktdp::AccessTileType::get(
             new_ab_shape, old_ab_type.getElementType());
 
-        mlir::IntegerSet new_ab_set = dropDimFromIntegerSet(
-            addr_buf_at.getAccessTileSet().getValue(), 0);
-        mlir::AffineMap new_ab_order =
-            dropDimFromAffineMap(addr_buf_at.getAccessTileOrder(), 0);
-        unsigned new_ab_rank = new_ab_set.getNumDims();
-        mlir::AffineMap new_ab_base_map =
-            mlir::AffineMap::getMultiDimIdentityMap(new_ab_rank, ctx);
-
-        // Indices: [for_iv, c0, ...]
+        // Indices: prior loop IVs for dims 0..k-1, current IV for dim k,
+        // %c0 for remaining dims.
         mlir::OpBuilder ab_idx_b(addr_buf_at);
         mlir::Value c0_ab =
             mlir::arith::ConstantIndexOp::create(ab_idx_b, loc, 0).getResult();
-        llvm::SmallVector<mlir::Value> new_ab_indices;
-        new_ab_indices.push_back(for_op.getInductionVar());
-        for (unsigned i = 1; i < new_ab_rank; ++i)
-          new_ab_indices.push_back(c0_ab);
+        llvm::SmallVector<mlir::Value> new_ab_indices(ab_num_dims, c0_ab);
+        for (unsigned d = 0; d < static_cast<unsigned>(k); ++d)
+          new_ab_indices[d] = window_ivs[d];
+        new_ab_indices[pin_dim] = for_op.getInductionVar();
 
         mlir::OpBuilder ab_b(addr_buf_at);
         auto new_addr_buf_at = mlir::ktdp::ConstructAccessTilesOp::create(
@@ -972,7 +1032,7 @@ static mlir::LogicalResult materializeWindowLoops(
             new_ab_base_map, new_ab_indices, new_ab_set, new_ab_order);
         pre_narrowed.push_back(new_addr_buf_at.getOperation());
 
-        // Rebuild the fill load with the narrowed addr_buf access tile.
+        // Rebuild the fill load.  Its result type mirrors new_ab_shape.
         mlir::RankedTensorType old_fill_type = mlir::cast<mlir::RankedTensorType>(
             fill_load.getResult().getType());
         mlir::OpBuilder fl_b(fill_load);
@@ -981,8 +1041,53 @@ static mlir::LogicalResult materializeWindowLoops(
             old_fill_type.getElementType());
         pre_narrowed.push_back(new_fill_load.getOperation());
 
-        // Update the store's data_tile and access_tile.
-        fill_store.getDataTileMutable().assign(new_fill_load.getResult());
+        // Insert tensor.collapse_shape to collapse the pinned leading dims of
+        // tensor<1x...x{iab_shape}xindex> down to tensor<{iab_shape}xindex>,
+        // matching the current IAB store operand shape (new_iab_shape).
+        //
+        // new_ab_shape:   [1, iab_d0, ..., iab_d{R-1}]   (k=0, W=1: [1,32])
+        //                 [1, 1, iab_d0, ..., iab_d{R-1}] (k=1, W=2: [1,1,32])
+        // new_iab_shape:  [iab_d0, ..., iab_d{R-1}]       (k=0, W=2: [2,32])
+        //                 [iab_d{R-1}]                     (k=1, W=2: [32])
+        //
+        // Reassociation: fold leading (ab_result_rank - new_iab_rank) pinned
+        // dims plus the first free dim into one group; remaining dims 1:1.
+        //   e.g. k=0,W=1: ab=2, iab=1 → [[0,1]]
+        //        k=0,W=1: ab=2, iab=1 → [[0,1]]          → tensor<32xindex>
+        //        k=0,W=2: ab=3, iab=2 → [[0,1],[2]]      → tensor<2x32xindex>
+        //        k=1,W=2: ab=3, iab=1 → [[0,1,2]]        → tensor<32xindex>
+        unsigned ab_result_rank =
+            static_cast<unsigned>(new_ab_shape.size());
+        unsigned target_rank =
+            static_cast<unsigned>(new_iab_shape.size());
+        unsigned pinned_dims = ab_result_rank - target_rank;
+        mlir::SmallVector<mlir::ReassociationIndices> reassoc;
+        // First group: all pinned dims plus the first free dim.
+        mlir::ReassociationIndices first_group;
+        for (unsigned d = 0; d <= pinned_dims; ++d)
+          first_group.push_back(static_cast<int64_t>(d));
+        reassoc.push_back(first_group);
+        // Remaining groups: one dim each.
+        for (unsigned d = pinned_dims + 1; d < ab_result_rank; ++d)
+          reassoc.push_back({static_cast<int64_t>(d)});
+
+        auto flat_type = mlir::RankedTensorType::get(
+            llvm::SmallVector<int64_t>(new_iab_shape.begin(),
+                                       new_iab_shape.end()),
+            old_fill_type.getElementType());
+        mlir::OpBuilder cs_b(fill_store);
+        auto collapsed = mlir::tensor::CollapseShapeOp::create(
+            cs_b, fill_store.getLoc(), flat_type,
+            new_fill_load.getResult(), reassoc);
+        pre_narrowed.push_back(collapsed.getOperation());
+
+        // Update the store's data_tile to the new collapsed tensor.
+        fill_store.getDataTileMutable().assign(collapsed.getResult());
+
+        // Erase the prior collapse_shape chain (inserted by earlier iterations)
+        // now that we have replaced it with the fresh one above.
+        for (auto prior : prior_collapses)
+          prior.erase();
 
         fill_load.erase();
         addr_buf_at.erase();

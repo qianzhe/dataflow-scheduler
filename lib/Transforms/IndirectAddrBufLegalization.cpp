@@ -655,15 +655,25 @@ static mlir::LogicalResult materializeWindowLoops(
 
   for (int64_t k = 0; k < W; ++k) {
     // ── Step 1: identify window variable w_k and trip count ──────────────
-    // The window variable being absorbed is always the first intermediate
-    // variable (index 0 in the region block args).  After each iteration the
-    // vars_set has one fewer dim, so the leading dim is always 0.
+    // The window variable being absorbed is the one that drives the outermost
+    // IAB subscript, i.e. ind_addr_buf_dim_positions[0].  That unified-space
+    // position minus the number of captured variables gives the index within
+    // the intermediate variable list (variables_space_set dim space).
+    unsigned num_captured_k = current_op.getCapturedVariables().size();
+    llvm::ArrayRef<int32_t> iab_positions_k =
+        current_op.getIndAddrBufDimPositions();
+    // iab_positions_k[0] is the unified-space position of the outermost IAB
+    // subscript; subtract captured vars to get the intermediate variable index.
+    unsigned absorbed_interm_idx =
+        static_cast<unsigned>(iab_positions_k[0]) - num_captured_k;
+
     mlir::IntegerSet vars_set = current_op.getVariablesSpaceSet().getValue();
-    auto trip_count = getTripCount(vars_set, /*dim_idx=*/0);
+    auto trip_count = getTripCount(vars_set, absorbed_interm_idx);
     if (!trip_count) {
       current_op.emitError()
           << "could not extract constant trip count for window variable " << k
-          << " from variables_space_set";
+          << " (intermediate var index " << absorbed_interm_idx
+          << ") from variables_space_set";
       return mlir::failure();
     }
     int64_t N = *trip_count;
@@ -752,45 +762,48 @@ static mlir::LogicalResult materializeWindowLoops(
         mlir::MemRefLayoutAttrInterface{}, iab_memory_space);
 
     // ── Steps 6 & 7: rebuild construct_indirect_access_tile ──────────────
-    // The window variable being absorbed is the first intermediate variable
-    // (region block arg 0).  Its position in the unified dimension space is
-    // capturedVars.size() + 0.
+    // The window variable being absorbed is the one that drives IAB dim 0
+    // (the outermost IAB subscript).  Its index in the intermediate variable
+    // list was already computed above as absorbed_interm_idx.  Its position in
+    // the unified (captured..., intermediate...) dimension space is:
     unsigned num_captured = current_op.getCapturedVariables().size();
-    unsigned absorbed_unified_dim = num_captured;  // first intermediate dim
+    unsigned absorbed_unified_dim = num_captured + absorbed_interm_idx;
 
     // Determine which access tile dimension corresponds to the absorbed window
-    // variable.  variables_space_order.getResult(0) is the expression that maps
-    // intermediate var 0 to its position in the access tile; it must be a plain
-    // AffineDimExpr whose position gives the tile dimension to drop.
+    // variable.  variables_space_order.getResult(absorbed_interm_idx) is the
+    // expression that maps that intermediate variable to its position in the
+    // access tile; it must be a plain AffineDimExpr.
     mlir::AffineMap vars_order_map = current_op.getVariablesSpaceOrder();
-    auto absorbed_dim_expr =
-        mlir::dyn_cast<mlir::AffineDimExpr>(vars_order_map.getResult(0));
+    auto absorbed_dim_expr = mlir::dyn_cast<mlir::AffineDimExpr>(
+        vars_order_map.getResult(absorbed_interm_idx));
     if (!absorbed_dim_expr) {
       current_op.emitError()
-          << "variables_space_order result 0 is not a plain dim expression; "
+          << "variables_space_order result " << absorbed_interm_idx
+          << " is not a plain dim expression; "
              "cannot determine access tile dimension to drop";
       return mlir::failure();
     }
     unsigned tile_dim_to_drop = absorbed_dim_expr.getPosition();
 
-    // Narrow variables_space_set and variables_space_order: drop dim 0
-    // (the leading intermediate dim, which is always the absorbed window var).
+    // Narrow variables_space_set and variables_space_order: drop the dim
+    // corresponding to the absorbed intermediate variable.
     mlir::IntegerSet new_vars_set = dropDimFromIntegerSet(
-        current_op.getVariablesSpaceSet().getValue(), /*drop_dim=*/0);
+        current_op.getVariablesSpaceSet().getValue(), absorbed_interm_idx);
     mlir::AffineMap new_vars_order = dropDimFromAffineMap(
-        current_op.getVariablesSpaceOrder(), /*drop_dim=*/0);
+        current_op.getVariablesSpaceOrder(), absorbed_interm_idx);
 
     // New numIntermediateVariables: one fewer than before.
     unsigned new_num_interm =
         static_cast<unsigned>(current_op.getIntermediateVariables().size()) - 1;
 
-    // Narrow ind_addr_buf_dim_positions: drop position 0 (the absorbed window
-    // dim).  The remaining positions are shifted down by one because
-    // absorbed_unified_dim is removed from the unified dimension space.
+    // Narrow ind_addr_buf_dim_positions: drop position 0 (the outermost IAB
+    // dim, which is always absorbed first).  The remaining positions are
+    // shifted down by one because absorbed_unified_dim is removed from the
+    // unified dimension space.
     llvm::ArrayRef<int32_t> old_iab_positions =
         current_op.getIndAddrBufDimPositions();
     llvm::SmallVector<int32_t> new_iab_positions;
-    // old_iab_positions[0] is the absorbed window dim; skip it.
+    // old_iab_positions[0] is the absorbed outermost IAB dim; skip it.
     for (size_t i = 1; i < old_iab_positions.size(); ++i) {
       int32_t pos = old_iab_positions[i];
       // Positions above absorbed_unified_dim shift down by 1.

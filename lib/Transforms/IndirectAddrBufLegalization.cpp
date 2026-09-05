@@ -132,15 +132,6 @@ static mlir::AffineMap dropDimFromAffineMap(mlir::AffineMap map,
 /// For a plain identity map that is just `dropDimFromAffineMap(map, tile_dim)`.
 /// For a permuted map, the input dim to drop is the AffineDimExpr position
 /// found at result `tile_dim`.
-static mlir::AffineMap dropTileDimFromOrderMap(mlir::AffineMap map,
-                                               unsigned tile_dim) {
-  // The result at `tile_dim` must be a plain AffineDimExpr identifying the
-  // input dimension that drives this tile output.
-  auto dim_expr = mlir::dyn_cast<mlir::AffineDimExpr>(map.getResult(tile_dim));
-  unsigned input_dim_to_drop = dim_expr ? dim_expr.getPosition() : tile_dim;
-  return dropDimFromAffineMap(map, input_dim_to_drop);
-}
-
 /// Return a copy of `shape` with the element at position `drop_dim` removed.
 static llvm::SmallVector<int64_t> dropShapeDim(llvm::ArrayRef<int64_t> shape,
                                                unsigned drop_dim) {
@@ -220,8 +211,9 @@ enum class PropDir { DOWN, UP };
 ///
 /// Returns failure() if `op` is unknown or internally inconsistent.
 static mlir::LogicalResult narrowOp(
-    mlir::Operation* op, unsigned tile_dim_to_drop, mlir::Value for_iv,
-    int64_t iab_rank, mlir::Location loc, mlir::MLIRContext* ctx,
+    mlir::Operation* op, unsigned tile_dim_to_drop,
+    llvm::ArrayRef<mlir::Value> window_ivs, int64_t iab_rank,
+    mlir::Location loc, mlir::MLIRContext* ctx,
     mlir::Operation** rebuilt_out = nullptr) {
   // ── ConstructIndirectAccessTileOp ────────────────────────────────────────
   // Pre-marked in narrowed_ops; must never be reached here.
@@ -248,8 +240,10 @@ static mlir::LogicalResult narrowOp(
   }
 
   // ── ktdp.construct_access_tile ────────────────────────────────────────────
-  // Narrow shape, access_tile_set, access_tile_order, and indices.
-  // Loop IV is placed at tile_dim_to_drop; c0 fills the remaining slots.
+  // Narrow shape, access_tile_set, access_tile_order, and indices (drop-based).
+  // The loop IV (window_ivs.back()) is placed at tile_dim_to_drop; prior IVs
+  // (window_ivs[0..k-2]) are placed at dims 0..k-2 for W>1 correctness;
+  // c0 fills the remaining slots.
   if (auto at = mlir::dyn_cast<mlir::ktdp::ConstructAccessTilesOp>(op)) {
     auto old_type =
         mlir::cast<mlir::ktdp::AccessTileType>(at.getResult().getType());
@@ -259,7 +253,7 @@ static mlir::LogicalResult narrowOp(
     mlir::IntegerSet new_set =
         dropDimFromIntegerSet(at.getAccessTileSet().getValue(), tile_dim_to_drop);
     mlir::AffineMap new_order =
-        dropTileDimFromOrderMap(at.getAccessTileOrder(), tile_dim_to_drop);
+        dropDimFromAffineMap(at.getAccessTileOrder(), tile_dim_to_drop);
     unsigned new_rank = new_set.getNumDims();
     mlir::AffineMap new_base_map =
         mlir::AffineMap::getMultiDimIdentityMap(new_rank, ctx);
@@ -268,7 +262,13 @@ static mlir::LogicalResult narrowOp(
     mlir::Value c0 =
         mlir::arith::ConstantIndexOp::create(ib, loc, 0).getResult();
     llvm::SmallVector<mlir::Value> new_indices(new_rank, c0);
-    if (tile_dim_to_drop < new_rank) new_indices[tile_dim_to_drop] = for_iv;
+    // Place prior window IVs at dims 0..k-2 (they have already been absorbed
+    // into the outer loops and represent the current iteration coordinates).
+    for (unsigned d = 0; d + 1 < window_ivs.size() && d < new_rank; ++d)
+      new_indices[d] = window_ivs[d];
+    // Place the current IV at tile_dim_to_drop (after the drop it shifts left
+    // but new_indices is sized for new_rank so use the shifted position).
+    if (tile_dim_to_drop < new_rank) new_indices[tile_dim_to_drop] = window_ivs.back();
 
     mlir::OpBuilder ab(at);
     auto new_at = mlir::ktdp::ConstructAccessTilesOp::create(
@@ -317,7 +317,7 @@ static mlir::LogicalResult narrowOp(
   }
 
   // ── linalg.generic ───────────────────────────────────────────────────────
-  // Narrow indexing_maps, iterator_types, and result type.
+  // Narrow indexing_maps, iterator_types, and result type (tensor space: drop).
   // tensor.empty outs operands are NOT handled here — the walk will visit
   // them via UP from the outs operand and call narrowOp(tensor.empty) there.
   if (auto generic = mlir::dyn_cast<mlir::linalg::GenericOp>(op)) {
@@ -385,7 +385,8 @@ static mlir::LogicalResult narrowOp(
 /// Parameters:
 ///   new_op           — Already-rebuilt ConstructIndirectAccessTileOp.
 ///   tile_dim_to_drop — Access-tile / tensor dimension to remove.
-///   for_iv           — Induction variable of the just-emitted scf.for.
+///   window_ivs       — All loop IVs accumulated so far (including the current
+///                      one). Passed through to narrowOp for index placement.
 ///   iab_rank         — Rank of the IAB memref *before* this absorption.
 ///   pre_narrowed     — Ops already correctly rebuilt by the caller (step 4/5
 ///                      of materializeWindowLoops): pre-inserted into
@@ -393,9 +394,9 @@ static mlir::LogicalResult narrowOp(
 ///   loc / ctx        — Needed when building new ops.
 static mlir::LogicalResult propagateNarrowing(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp new_op,
-    unsigned tile_dim_to_drop, mlir::Value for_iv, int64_t iab_rank,
-    llvm::ArrayRef<mlir::Operation*> pre_narrowed, mlir::Location loc,
-    mlir::MLIRContext* ctx) {
+    unsigned tile_dim_to_drop, llvm::ArrayRef<mlir::Value> window_ivs,
+    int64_t iab_rank, llvm::ArrayRef<mlir::Operation*> pre_narrowed,
+    mlir::Location loc, mlir::MLIRContext* ctx) {
   // The propagation is bounded to this block — the scf.for body.
   mlir::Block* const scope_block = new_op->getBlock();
 
@@ -445,8 +446,8 @@ static mlir::LogicalResult propagateNarrowing(
         if (user->getBlock() != scope_block) continue;
 
         if (!narrowed_ops.count(user)) {
-          if (mlir::failed(narrowOp(user, tile_dim_to_drop, for_iv, iab_rank,
-                                    loc, ctx)))
+          if (mlir::failed(narrowOp(user, tile_dim_to_drop, window_ivs,
+                                    iab_rank, loc, ctx)))
             return mlir::failure();
           narrowed_ops.insert(user);
         }
@@ -499,8 +500,8 @@ static mlir::LogicalResult propagateNarrowing(
         // once the AT is narrowed and its result is pushed DOWN.
         if (!mlir::isa<mlir::ktdp::LoadOp>(def_op)) {
           mlir::Operation* rebuilt = nullptr;
-          if (mlir::failed(narrowOp(def_op, tile_dim_to_drop, for_iv, iab_rank,
-                                    loc, ctx, &rebuilt)))
+          if (mlir::failed(narrowOp(def_op, tile_dim_to_drop, window_ivs,
+                                    iab_rank, loc, ctx, &rebuilt)))
             return mlir::failure();
           narrowed_ops.insert(def_op);
           if (rebuilt) {
@@ -656,6 +657,15 @@ static mlir::LogicalResult materializeWindowLoops(
   // Accumulate the loop IVs emitted on each iteration so that prior IVs can
   // be used as fixed subscripts in subsequent iterations.
   llvm::SmallVector<mlir::Value> window_ivs;
+
+  // State for deferred expand_shape insertion (output descriptor AT, step 5b).
+  // Declared outside the k-loop so the prior-iteration expand can be erased
+  // and replaced on the next iteration.
+  mlir::linalg::GenericOp deferred_out_generic;
+  mlir::ktdp::StoreOp deferred_out_store;
+  mlir::SmallVector<mlir::ReassociationIndices> deferred_out_reassoc;
+  mlir::RankedTensorType deferred_out_pinned_type;
+  mlir::tensor::ExpandShapeOp prior_out_expand;  // expand from previous k
 
   for (int64_t k = 0; k < W; ++k) {
     // ── Step 1: identify window variable w_k and trip count ──────────────
@@ -1098,6 +1108,311 @@ static mlir::LogicalResult materializeWindowLoops(
       iab_at.erase();
     }
 
+    // ── Step 5b: pin-not-drop for the output descriptor AT ───────────────
+    // The output ktdp.store (splice_end_op) stores the linalg.generic result
+    // into an output descriptor via a ktdp.construct_access_tile.  That AT
+    // must keep full base-memref rank (same invariant as the addr_buf AT).
+    // We rebuild the AT with dim k pinned to 1 and defer the expand_shape
+    // insertion until after propagateNarrowing (the generic result type is
+    // only drop-shaped after that call).
+    //
+    // On k > 0 the expand_shape from the prior iteration lives in the new
+    // for body.  Add it to pre_narrowed so propagateNarrowing skips it,
+    // then erase it once the new expand is inserted.
+    //
+    // This only applies to descriptor (ConstructAccessTilesOp) output ATs.
+    // In scatter the output AT is a ConstructIndirectAccessTileOp — skip.
+
+    // Reset deferred state for this iteration.
+    // If a prior-iteration expand_shape exists, remove it before propagateNarrowing
+    // runs (so the walk never sees the stale type): reconnect the store to the
+    // generic result directly, then erase the expand.
+    if (prior_out_expand) {
+      if (deferred_out_store && deferred_out_generic)
+        deferred_out_store.getDataTileMutable().assign(
+            deferred_out_generic.getResult(0));
+      prior_out_expand.erase();
+      prior_out_expand = mlir::tensor::ExpandShapeOp{};
+    }
+    deferred_out_generic = mlir::linalg::GenericOp{};
+    deferred_out_store = mlir::ktdp::StoreOp{};
+    deferred_out_reassoc.clear();
+    deferred_out_pinned_type = mlir::RankedTensorType{};
+
+    if (auto out_store =
+            mlir::dyn_cast_if_present<mlir::ktdp::StoreOp>(splice_end_op)) {
+      if (auto out_at = mlir::dyn_cast_if_present<mlir::ktdp::ConstructAccessTilesOp>(
+              out_store.getAccessTile().getDefiningOp())) {
+
+        // ── Rebuild the output AT with pin-not-drop ─────────────────────
+        mlir::IntegerSet old_out_set = out_at.getAccessTileSet().getValue();
+        unsigned out_num_dims = old_out_set.getNumDims();
+        unsigned out_pin_dim = static_cast<unsigned>(k);
+
+        // Replace the upper-bound inequality on dim k with -d_k >= 0 (pin).
+        llvm::SmallVector<mlir::AffineExpr> new_out_constraints;
+        llvm::SmallVector<bool> new_out_eq_flags;
+        mlir::AffineExpr dk_out = mlir::getAffineDimExpr(out_pin_dim, ctx);
+        bool replaced_out_ub = false;
+        for (unsigned ci = 0; ci < old_out_set.getNumConstraints(); ++ci) {
+          mlir::AffineExpr c = old_out_set.getConstraint(ci);
+          bool is_eq = old_out_set.isEq(ci);
+          if (!is_eq && c.isFunctionOfDim(out_pin_dim) && !replaced_out_ub) {
+            if (c != dk_out) {
+              new_out_constraints.push_back(
+                  mlir::getAffineConstantExpr(0, ctx) - dk_out);
+              new_out_eq_flags.push_back(false);
+              replaced_out_ub = true;
+              continue;
+            }
+          }
+          new_out_constraints.push_back(c);
+          new_out_eq_flags.push_back(is_eq);
+        }
+        mlir::IntegerSet new_out_set = mlir::IntegerSet::get(
+            out_num_dims, old_out_set.getNumSymbols(),
+            new_out_constraints, new_out_eq_flags);
+
+        mlir::AffineMap new_out_order = out_at.getAccessTileOrder();
+        mlir::AffineMap new_out_base_map =
+            mlir::AffineMap::getMultiDimIdentityMap(out_num_dims, ctx);
+
+        // Result shape: dim k becomes 1 (pinned), others unchanged.
+        auto old_out_type = mlir::cast<mlir::ktdp::AccessTileType>(
+            out_at.getResult().getType());
+        llvm::SmallVector<int64_t> new_out_shape(
+            old_out_type.getShape().begin(), old_out_type.getShape().end());
+        new_out_shape[out_pin_dim] = 1;
+        auto new_out_type = mlir::ktdp::AccessTileType::get(
+            new_out_shape, old_out_type.getElementType());
+
+        // Indices: prior IVs at dims 0..k-1, current IV at dim k, c0 elsewhere.
+        mlir::OpBuilder out_idx_b(out_at);
+        mlir::Value c0_out =
+            mlir::arith::ConstantIndexOp::create(out_idx_b, loc, 0).getResult();
+        llvm::SmallVector<mlir::Value> new_out_indices(out_num_dims, c0_out);
+        for (unsigned d = 0; d < static_cast<unsigned>(k); ++d)
+          new_out_indices[d] = window_ivs[d];
+        new_out_indices[out_pin_dim] = for_op.getInductionVar();
+
+        mlir::OpBuilder out_at_b(out_at);
+        auto new_out_at = mlir::ktdp::ConstructAccessTilesOp::create(
+            out_at_b, out_at.getLoc(), new_out_type, out_at.getBase(),
+            new_out_base_map, new_out_indices, new_out_set, new_out_order);
+        pre_narrowed.push_back(new_out_at.getOperation());
+
+        // ── Find linalg.generic from the store's data_tile ──────────────
+        // The output store's data_tile is the linalg.generic result directly
+        // (there is no intermediate load from the output AT).
+        mlir::linalg::GenericOp out_generic;
+        if (auto gen = mlir::dyn_cast_if_present<mlir::linalg::GenericOp>(
+                out_store.getDataTile().getDefiningOp()))
+          out_generic = gen;
+
+        if (out_generic) {
+          // Build reassociation: fold the k+1 pinned leading dims (all 1) with
+          // the first free dim into one group; remaining dims are 1:1.
+          // e.g. k=0: new_out_shape=[1,32,2,64]   → [[0,1],[2],[3]]
+          //      k=1: new_out_shape=[1,1,32,2,64] → [[0,1,2],[3],[4]]
+          unsigned out_pinned_dims = static_cast<unsigned>(k + 1);
+          unsigned out_result_rank = static_cast<unsigned>(new_out_shape.size());
+          mlir::SmallVector<mlir::ReassociationIndices> out_reassoc;
+          mlir::ReassociationIndices first_out_group;
+          for (unsigned d = 0; d <= out_pinned_dims; ++d)
+            first_out_group.push_back(static_cast<int64_t>(d));
+          out_reassoc.push_back(first_out_group);
+          for (unsigned d = out_pinned_dims + 1; d < out_result_rank; ++d)
+            out_reassoc.push_back({static_cast<int64_t>(d)});
+
+          mlir::Type out_elem_type = mlir::cast<mlir::RankedTensorType>(
+              out_store.getDataTile().getType()).getElementType();
+
+          // Defer expand_shape insertion until after propagateNarrowing:
+          // the generic result type is only drop-shaped after that call.
+          // At that point, expand_shape restores the pinned shape for the store.
+          deferred_out_generic = out_generic;
+          deferred_out_store = out_store;
+          deferred_out_reassoc = out_reassoc;
+          deferred_out_pinned_type = mlir::RankedTensorType::get(
+              llvm::SmallVector<int64_t>(new_out_shape.begin(),
+                                        new_out_shape.end()),
+              out_elem_type);
+
+          // Mark the store as pre_narrowed so propagateNarrowing skips it.
+          pre_narrowed.push_back(out_store.getOperation());
+        }
+
+        // RAUW old AT result and erase.
+        out_at.getResult().replaceAllUsesWith(new_out_at.getResult());
+        out_at.erase();
+      }
+    }
+
+    // ── Step 5c: pin-not-drop for the scatter source descriptor AT ───────
+    // In scatter the source data flows: ConstructAccessTilesOp → ktdp.load
+    // → linalg.generic ins → ktdp.store (indirect AT).  The source AT must
+    // keep full base-memref rank (same invariant as addr_buf AT and gather
+    // output AT).  We pin-not-drop the source AT and insert collapse_shape
+    // after the new load to feed linalg.generic at drop-shaped rank.
+    //
+    // Unlike the gather output AT (step 5b), the collapse is NOT deferred:
+    // it feeds the generic ins operand and must be in place before
+    // propagateNarrowing narrows the generic.
+    //
+    // On k > 0 the prior-iteration collapse is erased and replaced (same
+    // pattern as the addr_buf fill chain in step 5).
+    //
+    // This only applies when the linalg.generic ins comes through a
+    // ConstructAccessTilesOp (scatter).  In gather the ins is the indirect
+    // AT result — a ConstructIndirectAccessTileOp — and this block is skipped.
+    {
+      // Find any linalg.generic in scope_block (after the splice it is in the
+      // new for body; current_op is not yet rebuilt so use splice_end_op's
+      // block to locate it).
+      mlir::Block* body = splice_end_op->getBlock();
+      mlir::linalg::GenericOp src_generic;
+      for (mlir::Operation& blk_op : *body) {
+        if (auto gen = mlir::dyn_cast<mlir::linalg::GenericOp>(&blk_op)) {
+          src_generic = gen;
+          break;
+        }
+      }
+
+      if (src_generic) {
+        // For each ins operand: walk through any prior collapse_shape chain
+        // to reach the ktdp.load, then check whether its AT is a
+        // ConstructAccessTilesOp (i.e. a descriptor AT, not the indirect AT).
+        for (unsigned ins_idx = 0; ins_idx < src_generic.getInputs().size();
+             ++ins_idx) {
+          mlir::Value ins_val = src_generic.getInputs()[ins_idx];
+
+          // Walk through any prior collapse_shape inserted by iteration k-1.
+          llvm::SmallVector<mlir::tensor::CollapseShapeOp> prior_collapses;
+          while (auto cs = mlir::dyn_cast_if_present<mlir::tensor::CollapseShapeOp>(
+                     ins_val.getDefiningOp())) {
+            prior_collapses.push_back(cs);
+            ins_val = cs.getSrc();
+          }
+
+          auto src_load = mlir::dyn_cast_if_present<mlir::ktdp::LoadOp>(
+              ins_val.getDefiningOp());
+          if (!src_load) continue;
+
+          auto src_at = mlir::dyn_cast_if_present<mlir::ktdp::ConstructAccessTilesOp>(
+              src_load.getAccessTile().getDefiningOp());
+          if (!src_at) continue;
+
+          // Found the scatter source AT.  Apply pin-not-drop.
+          mlir::IntegerSet old_src_set = src_at.getAccessTileSet().getValue();
+          unsigned src_num_dims = old_src_set.getNumDims();
+          unsigned src_pin_dim = static_cast<unsigned>(k);
+
+          // Replace upper-bound on dim k with -d_k >= 0 (pin).
+          llvm::SmallVector<mlir::AffineExpr> new_src_constraints;
+          llvm::SmallVector<bool> new_src_eq_flags;
+          mlir::AffineExpr dk_src = mlir::getAffineDimExpr(src_pin_dim, ctx);
+          bool replaced_src_ub = false;
+          for (unsigned ci = 0; ci < old_src_set.getNumConstraints(); ++ci) {
+            mlir::AffineExpr c = old_src_set.getConstraint(ci);
+            bool is_eq = old_src_set.isEq(ci);
+            if (!is_eq && c.isFunctionOfDim(src_pin_dim) && !replaced_src_ub) {
+              if (c != dk_src) {
+                new_src_constraints.push_back(
+                    mlir::getAffineConstantExpr(0, ctx) - dk_src);
+                new_src_eq_flags.push_back(false);
+                replaced_src_ub = true;
+                continue;
+              }
+            }
+            new_src_constraints.push_back(c);
+            new_src_eq_flags.push_back(is_eq);
+          }
+          mlir::IntegerSet new_src_set = mlir::IntegerSet::get(
+              src_num_dims, old_src_set.getNumSymbols(),
+              new_src_constraints, new_src_eq_flags);
+
+          mlir::AffineMap new_src_order = src_at.getAccessTileOrder();
+          mlir::AffineMap new_src_base_map =
+              mlir::AffineMap::getMultiDimIdentityMap(src_num_dims, ctx);
+
+          // Result shape: pin dim k to 1, keep others.
+          auto old_src_type = mlir::cast<mlir::ktdp::AccessTileType>(
+              src_at.getResult().getType());
+          llvm::SmallVector<int64_t> new_src_shape(
+              old_src_type.getShape().begin(), old_src_type.getShape().end());
+          new_src_shape[src_pin_dim] = 1;
+          auto new_src_type = mlir::ktdp::AccessTileType::get(
+              new_src_shape, old_src_type.getElementType());
+
+          // Indices: prior IVs at 0..k-1, current IV at k, c0 elsewhere.
+          mlir::OpBuilder src_idx_b(src_at);
+          mlir::Value c0_src =
+              mlir::arith::ConstantIndexOp::create(src_idx_b, loc, 0).getResult();
+          llvm::SmallVector<mlir::Value> new_src_indices(src_num_dims, c0_src);
+          for (unsigned d = 0; d < static_cast<unsigned>(k); ++d)
+            new_src_indices[d] = window_ivs[d];
+          new_src_indices[src_pin_dim] = for_op.getInductionVar();
+
+          mlir::OpBuilder src_at_b(src_at);
+          auto new_src_at = mlir::ktdp::ConstructAccessTilesOp::create(
+              src_at_b, src_at.getLoc(), new_src_type, src_at.getBase(),
+              new_src_base_map, new_src_indices, new_src_set, new_src_order);
+          pre_narrowed.push_back(new_src_at.getOperation());
+
+          // Rebuild the load from the pinned AT.
+          auto old_src_load_type = mlir::cast<mlir::RankedTensorType>(
+              src_load.getResult().getType());
+          mlir::OpBuilder sl_b(src_load);
+          auto new_src_load = mlir::ktdp::LoadOp::create(
+              sl_b, src_load.getLoc(), new_src_at.getResult(),
+              old_src_load_type.getElementType());
+          pre_narrowed.push_back(new_src_load.getOperation());
+
+          // Insert collapse_shape: pinned load → drop-shaped ins.
+          // Reassociation: fold k+1 pinned leading dims with first free dim.
+          // e.g. k=0: new_src_shape=[1,32,2,64]   → [[0,1],[2],[3]]
+          //      k=1: new_src_shape=[1,1,32,2,64] → [[0,1,2],[3],[4]]
+          unsigned src_pinned_dims = static_cast<unsigned>(k + 1);
+          unsigned src_result_rank = static_cast<unsigned>(new_src_shape.size());
+          llvm::SmallVector<int64_t> src_drop_shape(
+              new_src_shape.begin() + src_pinned_dims, new_src_shape.end());
+
+          mlir::SmallVector<mlir::ReassociationIndices> src_reassoc;
+          mlir::ReassociationIndices first_src_group;
+          for (unsigned d = 0; d <= src_pinned_dims; ++d)
+            first_src_group.push_back(static_cast<int64_t>(d));
+          src_reassoc.push_back(first_src_group);
+          for (unsigned d = src_pinned_dims + 1; d < src_result_rank; ++d)
+            src_reassoc.push_back({static_cast<int64_t>(d)});
+
+          mlir::Type src_elem_type = mlir::cast<mlir::RankedTensorType>(
+              src_load.getResult().getType()).getElementType();
+          auto src_collapsed_type = mlir::RankedTensorType::get(
+              llvm::SmallVector<int64_t>(src_drop_shape.begin(),
+                                        src_drop_shape.end()),
+              src_elem_type);
+
+          mlir::OpBuilder cs_src_b(src_generic);
+          auto new_src_collapse = mlir::tensor::CollapseShapeOp::create(
+              cs_src_b, src_generic.getLoc(), src_collapsed_type,
+              new_src_load.getResult(), src_reassoc);
+          pre_narrowed.push_back(new_src_collapse.getOperation());
+
+          // Replace the generic's ins operand.
+          src_generic.getInputsMutable()[ins_idx].assign(
+              new_src_collapse.getResult());
+
+          // Erase prior-iteration collapse chain and old load/AT.
+          for (auto prior : prior_collapses) prior.erase();
+          src_load.erase();
+          src_at.getResult().replaceAllUsesWith(new_src_at.getResult());
+          src_at.erase();
+
+          break;  // only one scatter source AT per linalg.generic
+        }
+      }
+    }
+
     // Build the replacement op at the same position as current_op.
     mlir::OpBuilder replace_builder(current_op);
     auto new_op = mlir::ktdp_lowering::ConstructIndirectAccessTileOp::create(
@@ -1118,9 +1433,22 @@ static mlir::LogicalResult materializeWindowLoops(
     // pre_narrowed contains the IAB mv and IAB fill chain ops already rebuilt
     // by steps 4/5 so the walk does not attempt to re-narrow them.
     if (mlir::failed(propagateNarrowing(new_op, tile_dim_to_drop,
-                                        for_op.getInductionVar(), iab_rank,
+                                        window_ivs, iab_rank,
                                         pre_narrowed, loc, ctx)))
       return mlir::failure();
+
+    // ── Step 5b deferred: insert expand_shape after propagateNarrowing ──
+    // Now that propagateNarrowing has drop-narrowed the linalg.generic result,
+    // insert expand_shape to restore the pinned shape for the output store AT.
+    // Erase the prior-iteration expand (if any) — it is superseded by this one.
+    if (deferred_out_generic) {
+      mlir::OpBuilder es_b(deferred_out_generic->getNextNode());
+      auto out_expand = mlir::tensor::ExpandShapeOp::create(
+          es_b, deferred_out_generic.getLoc(), deferred_out_pinned_type,
+          deferred_out_generic.getResult(0), deferred_out_reassoc);
+      deferred_out_store.getDataTileMutable().assign(out_expand.getResult());
+      prior_out_expand = out_expand;
+    }
   }
 
   return mlir::success();

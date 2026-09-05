@@ -15,8 +15,8 @@
 // Sub-step 2b (per-entry loop + scf.if guard) is not yet implemented.
 
 // CHECK-LABEL: func.func @local_schedule_1
-// CHECK:         scf.for {{.*}} to %c2 step
-// CHECK:           ktdp.construct_access_tile {{.*}} -> !ktdp.access_tile<1x32xindex>
+// CHECK:         scf.for [[IV:%arg[0-9]+]] = {{.*}} to %c2 step
+// CHECK:           ktdp.construct_access_tile {{.*}}{{\[}}[[IV]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x32xindex>
 // CHECK:           ktdp.load {{.*}} <1x32xindex> -> tensor<1x32xindex>
 // CHECK:           ktdp_lowering.construct_memory_view {{.*}} sizes: [32],
 // CHECK-SAME:        memory_space = "IAB"
@@ -27,6 +27,9 @@
 // CHECK:           ktdp.load {{.*}} <32x2x64xindex> -> tensor<32x2x64xf16>
 // CHECK:           linalg.generic
 // CHECK-SAME:        iterator_types = ["parallel", "parallel", "parallel"]
+// CHECK:           tensor.expand_shape {{.*}} {{\[\[}}0, 1{{.*}}tensor<32x2x64xf16> into tensor<1x32x2x64xf16>
+// CHECK:           ktdp.construct_access_tile {{.*}}{{\[}}[[IV]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x32x2x64xindex>
+// CHECK:           ktdp.store {{.*}} tensor<1x32x2x64xf16>, <1x32x2x64xindex>
 // CHECK:         } {loop_type = #ktdf.loop_type<parallel_loop>}
 
 #set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0)>

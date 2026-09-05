@@ -18,12 +18,15 @@
 // Sub-step 2b (per-entry loop + scf.if guard) is not yet implemented.
 
 // CHECK-LABEL: func.func @local_schedule_1
-// CHECK:         scf.for {{.*}} to %c2 step
+// CHECK:         scf.for [[IV:%arg[0-9]+]] = {{.*}} to %c2 step
+// CHECK:           ktdp.construct_access_tile {{.*}}{{\[}}[[IV]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x32x2x64xindex>
+// CHECK:           ktdp.load {{.*}} <1x32x2x64xindex> -> tensor<1x32x2x64xf16>
+// CHECK:           tensor.collapse_shape {{.*}} {{\[\[}}0, 1{{.*}}tensor<1x32x2x64xf16> into tensor<32x2x64xf16>
 // CHECK:           linalg.generic
 // CHECK-SAME:        iterator_types = ["parallel", "parallel", "parallel"]
 // CHECK:           ktdp_lowering.construct_memory_view {{.*}} sizes: [32],
 // CHECK-SAME:        memory_space = "IAB"
-// CHECK:           ktdp.construct_access_tile {{.*}} -> !ktdp.access_tile<1x32xindex>
+// CHECK:           ktdp.construct_access_tile {{.*}}{{\[}}[[IV]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x32xindex>
 // CHECK:           ktdp.load {{.*}} <1x32xindex> -> tensor<1x32xindex>
 // CHECK:           tensor.collapse_shape {{.*}} {{\[\[}}0, 1{{\]\]}}
 // CHECK-SAME:        tensor<1x32xindex> into tensor<32xindex>

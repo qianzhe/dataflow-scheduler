@@ -14,9 +14,9 @@
 //   - indirect access tile result: 32×2×64.
 
 // CHECK-LABEL: func.func @local_schedule_1
-// CHECK:         scf.for {{.*}} to %c3 step
-// CHECK:           scf.for {{.*}} to %c2 step
-// CHECK:             ktdp.construct_access_tile {{.*}} -> !ktdp.access_tile<1x1x32xindex>
+// CHECK:         scf.for [[IV0:%arg[0-9]+]] = {{.*}} to %c3 step
+// CHECK:           scf.for [[IV1:%arg[0-9]+]] = {{.*}} to %c2 step
+// CHECK:             ktdp.construct_access_tile {{.*}}{{\[}}[[IV0]], [[IV1]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x32xindex>
 // CHECK:             ktdp.load {{.*}} <1x1x32xindex> -> tensor<1x1x32xindex>
 // CHECK:             ktdp_lowering.construct_memory_view {{.*}} sizes: [32],
 // CHECK-SAME:          memory_space = "IAB"
@@ -27,6 +27,9 @@
 // CHECK:             ktdp.load {{.*}} <32x2x64xindex> -> tensor<32x2x64xf16>
 // CHECK:             linalg.generic
 // CHECK-SAME:          iterator_types = ["parallel", "parallel", "parallel"]
+// CHECK:             tensor.expand_shape {{.*}} {{\[\[}}0, 1, 2{{.*}}tensor<32x2x64xf16> into tensor<1x1x32x2x64xf16>
+// CHECK:             ktdp.construct_access_tile {{.*}}{{\[}}[[IV0]], [[IV1]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x32x2x64xindex>
+// CHECK:             ktdp.store {{.*}} tensor<1x1x32x2x64xf16>, <1x1x32x2x64xindex>
 // CHECK:           } {loop_type = #ktdf.loop_type<parallel_loop>}
 // CHECK:         } {loop_type = #ktdf.loop_type<parallel_loop>}
 

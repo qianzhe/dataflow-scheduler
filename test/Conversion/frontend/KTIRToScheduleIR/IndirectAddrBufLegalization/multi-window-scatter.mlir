@@ -17,11 +17,14 @@
 //     before the addr_buf fill (scatter order).
 
 // CHECK-LABEL: func.func @local_schedule_1
-// CHECK:         scf.for {{.*}} to %c3 step
-// CHECK:           scf.for {{.*}} to %c2 step
+// CHECK:         scf.for [[IV0:%arg[0-9]+]] = {{.*}} to %c3 step
+// CHECK:           scf.for [[IV1:%arg[0-9]+]] = {{.*}} to %c2 step
+// CHECK:             ktdp.construct_access_tile {{.*}}{{\[}}[[IV0]], [[IV1]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x32x2x64xindex>
+// CHECK:             ktdp.load {{.*}} <1x1x32x2x64xindex> -> tensor<1x1x32x2x64xf16>
+// CHECK:             tensor.collapse_shape {{.*}} {{\[\[}}0, 1, 2{{.*}}tensor<1x1x32x2x64xf16> into tensor<32x2x64xf16>
 // CHECK:             linalg.generic
 // CHECK-SAME:          iterator_types = ["parallel", "parallel", "parallel"]
-// CHECK:             ktdp.construct_access_tile {{.*}} -> !ktdp.access_tile<1x1x32xindex>
+// CHECK:             ktdp.construct_access_tile {{.*}}{{\[}}[[IV0]], [[IV1]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x32xindex>
 // CHECK:             ktdp.load {{.*}} <1x1x32xindex> -> tensor<1x1x32xindex>
 // CHECK:             ktdp_lowering.construct_memory_view {{.*}} sizes: [32],
 // CHECK-SAME:          memory_space = "IAB"

@@ -96,9 +96,46 @@ static mlir::IntegerSet dropDimFromIntegerSet(mlir::IntegerSet set,
                                new_constraints, new_eq_flags);
 }
 
+/// Pin dimension `pin_dim` of `set` to the single value 0 by replacing its
+/// upper-bound inequality (`-d_k + (N-1) >= 0`) with `-d_k >= 0`.  The
+/// lower bound (`d_k >= 0`) and all constraints that do not involve `pin_dim`
+/// are kept, so the set keeps its dimension count — unlike
+/// dropDimFromIntegerSet, which removes the dimension entirely.
+static mlir::IntegerSet pinDimInIntegerSet(mlir::IntegerSet set,
+                                           unsigned pin_dim) {
+  mlir::MLIRContext* ctx = set.getContext();
+  mlir::AffineExpr dk = mlir::getAffineDimExpr(pin_dim, ctx);
+
+  llvm::SmallVector<mlir::AffineExpr> new_constraints;
+  llvm::SmallVector<bool> new_eq_flags;
+  bool replaced_ub = false;
+  for (unsigned i = 0; i < set.getNumConstraints(); ++i) {
+    mlir::AffineExpr c = set.getConstraint(i);
+    bool is_eq = set.isEq(i);
+    // The upper bound on pin_dim is the first inequality involving pin_dim
+    // that is not the bare lower-bound expression (d_k >= 0).
+    if (!is_eq && !replaced_ub && c.isFunctionOfDim(pin_dim) && c != dk) {
+      new_constraints.push_back(mlir::getAffineConstantExpr(0, ctx) - dk);
+      new_eq_flags.push_back(false);
+      replaced_ub = true;
+      continue;
+    }
+    new_constraints.push_back(c);
+    new_eq_flags.push_back(is_eq);
+  }
+
+  return mlir::IntegerSet::get(set.getNumDims(), set.getNumSymbols(),
+                               new_constraints, new_eq_flags);
+}
+
 /// Drop dimension `drop_dim` from `map` (which maps `orig_num_dims` dims).
 /// The result expression at position `drop_dim` is removed; remaining
 /// expressions with dim indices above `drop_dim` are shifted down.
+///
+/// Note: input dim `drop_dim` and result position `drop_dim` are dropped
+/// together.  For a square permutation map (e.g. access_tile_order) that is
+/// only the intended narrowing when result `drop_dim` is `d_drop_dim`; a
+/// permuted map would need the input dim found at result `drop_dim` instead.
 static mlir::AffineMap dropDimFromAffineMap(mlir::AffineMap map,
                                             unsigned drop_dim) {
   mlir::MLIRContext* ctx = map.getContext();
@@ -126,13 +163,6 @@ static mlir::AffineMap dropDimFromAffineMap(mlir::AffineMap map,
                               ctx);
 }
 
-/// Narrow an access_tile_order map by dropping both the result at
-/// `tile_dim` and the corresponding input dimension.  access_tile_order is
-/// always a square permutation map (same number of inputs and outputs), so
-/// we must drop the input dim that maps to output position `tile_dim`.
-/// For a plain identity map that is just `dropDimFromAffineMap(map, tile_dim)`.
-/// For a permuted map, the input dim to drop is the AffineDimExpr position
-/// found at result `tile_dim`.
 /// Return a copy of `shape` with the element at position `drop_dim` removed.
 static llvm::SmallVector<int64_t> dropShapeDim(llvm::ArrayRef<int64_t> shape,
                                                unsigned drop_dim) {
@@ -621,6 +651,79 @@ static std::pair<mlir::Operation*, mlir::Operation*> findSpliceBoundary(
   return {splice_begin, splice_end};
 }
 
+/// Rebuild `at` with dimension `pin_dim` *pinned* to a single element instead
+/// of dropped: the access tile keeps its full base-memref rank, dim `pin_dim`
+/// gets extent 1, and its subscript becomes the current window loop IV.
+///
+/// This is the "pin-not-drop" strategy required for every access tile built on
+/// a base descriptor memref (addr_buf, output descriptor, source descriptor):
+/// dropping a dim there would break the ConstructAccessTilesOp invariant
+/// `access_tile_set.numDims == base_map.numInputs == base memref rank`.
+///
+/// `window_ivs` holds the IVs of all window loops materialised so far, current
+/// (innermost) one last; `pin_dim` must be its index.  Dims 0..pin_dim-1 were
+/// pinned by earlier iterations and take their own IV as subscript; dims above
+/// pin_dim take %c0.
+///
+/// The caller owns the old op: this only inserts the replacement at `at`'s
+/// position (along with the %c0 it needs) and returns it.
+static mlir::ktdp::ConstructAccessTilesOp rebuildAccessTilePinned(
+    mlir::ktdp::ConstructAccessTilesOp at, unsigned pin_dim,
+    llvm::ArrayRef<mlir::Value> window_ivs, mlir::Location loc,
+    mlir::MLIRContext* ctx) {
+  assert(pin_dim + 1 == window_ivs.size() &&
+         "pin_dim must index the innermost window loop IV");
+  mlir::IntegerSet old_set = at.getAccessTileSet().getValue();
+  unsigned num_dims = old_set.getNumDims();
+  assert(pin_dim < num_dims && "pin_dim out of range for access_tile_set");
+
+  mlir::IntegerSet new_set = pinDimInIntegerSet(old_set, pin_dim);
+
+  // access_tile_order and base_map keep the full base-memref rank.
+  mlir::AffineMap new_order = at.getAccessTileOrder();
+  mlir::AffineMap new_base_map =
+      mlir::AffineMap::getMultiDimIdentityMap(num_dims, ctx);
+
+  // Result shape: dim pin_dim becomes 1, all others unchanged.
+  auto old_type =
+      mlir::cast<mlir::ktdp::AccessTileType>(at.getResult().getType());
+  llvm::SmallVector<int64_t> new_shape(old_type.getShape().begin(),
+                                      old_type.getShape().end());
+  new_shape[pin_dim] = 1;
+  auto new_type =
+      mlir::ktdp::AccessTileType::get(new_shape, old_type.getElementType());
+
+  // Subscripts: one IV per pinned dim 0..pin_dim, %c0 for the free dims above.
+  mlir::OpBuilder builder(at);
+  mlir::Value c0 =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  llvm::SmallVector<mlir::Value> new_indices(num_dims, c0);
+  for (unsigned d = 0; d <= pin_dim; ++d) new_indices[d] = window_ivs[d];
+
+  return mlir::ktdp::ConstructAccessTilesOp::create(
+      builder, at.getLoc(), new_type, at.getBase(), new_base_map, new_indices,
+      new_set, new_order);
+}
+
+/// Build the reassociation for a collapse/expand that folds the leading
+/// `folded_leading_dims` unit dims of a rank-`result_rank` shape into the
+/// first following dim; the remaining dims map 1:1.
+///   result_rank=2, folded=1 → [[0,1]]
+///   result_rank=4, folded=1 → [[0,1],[2],[3]]
+///   result_rank=5, folded=2 → [[0,1,2],[3],[4]]
+static mlir::SmallVector<mlir::ReassociationIndices>
+makeLeadingFoldReassociation(unsigned result_rank,
+                             unsigned folded_leading_dims) {
+  mlir::SmallVector<mlir::ReassociationIndices> reassoc;
+  mlir::ReassociationIndices first_group;
+  for (unsigned d = 0; d <= folded_leading_dims; ++d)
+    first_group.push_back(static_cast<int64_t>(d));
+  reassoc.push_back(first_group);
+  for (unsigned d = folded_leading_dims + 1; d < result_rank; ++d)
+    reassoc.push_back({static_cast<int64_t>(d)});
+  return reassoc;
+}
+
 /// Sub-step 2a: for one ConstructIndirectAccessTileOp, materialise all window
 /// scf.for loops (all IAB subscript dimensions except the innermost per-entry
 /// one), narrowing the IAB memref and updating the op on each iteration.
@@ -965,83 +1068,18 @@ static mlir::LogicalResult materializeWindowLoops(
                 fill_load.getAccessTile().getDefiningOp());
         if (!addr_buf_at) continue;
 
-        // Rebuild the addr_buf access tile keeping the full base-memref rank.
-        // The window dimension (dim 0) is NOT dropped from the set/order/shape.
-        // Instead we pin dim 0 to exactly 1 element by replacing the old upper
-        // bound constraint (-d0 + N-1 >= 0) with (-d0 >= 0), giving shape [1,
-        // 32, ...].  This satisfies the ConstructAccessTilesOp invariant
-        // (access_tile_set.numDims == base_map.numInputs == memref rank == 2)
-        // without changing the op's verifier.
-        //
-        // On iteration k, dim k of the addr_buf tile is newly pinned to 1.
-        // Dims 0..k-1 were already pinned by prior iterations (shape = 1).
-        // The indices list has ab_num_dims entries: index k = loop IV, all
-        // others = %c0.  access_tile_set pins dim k by replacing its upper-
-        // bound constraint with -d_k >= 0.
-
-        mlir::IntegerSet old_ab_set =
-            addr_buf_at.getAccessTileSet().getValue();
-        unsigned ab_num_dims = old_ab_set.getNumDims();
-        unsigned pin_dim = static_cast<unsigned>(k);
-
-        // Build updated access_tile_set: replace the upper-bound inequality on
-        // dim k (-d_k + (N-1) >= 0) with -d_k >= 0, pinning dim k to [0,0].
-        // The lower-bound (d_k >= 0) is kept unchanged.
-        llvm::SmallVector<mlir::AffineExpr> new_ab_constraints;
-        llvm::SmallVector<bool> new_ab_eq_flags;
-        mlir::AffineExpr dk = mlir::getAffineDimExpr(pin_dim, ctx);
-        bool replaced_ub = false;
-        for (unsigned ci = 0; ci < old_ab_set.getNumConstraints(); ++ci) {
-          mlir::AffineExpr c = old_ab_set.getConstraint(ci);
-          bool is_eq = old_ab_set.isEq(ci);
-          // Detect the upper-bound on dim k: an inequality involving dim k
-          // that is not the bare lower-bound expression (d_k >= 0).
-          if (!is_eq && c.isFunctionOfDim(pin_dim) && !replaced_ub) {
-            if (c != dk) {
-              // Replace with -d_k >= 0.
-              new_ab_constraints.push_back(
-                  mlir::getAffineConstantExpr(0, ctx) - dk);
-              new_ab_eq_flags.push_back(false);
-              replaced_ub = true;
-              continue;
-            }
-          }
-          new_ab_constraints.push_back(c);
-          new_ab_eq_flags.push_back(is_eq);
-        }
-        mlir::IntegerSet new_ab_set = mlir::IntegerSet::get(
-            ab_num_dims, old_ab_set.getNumSymbols(),
-            new_ab_constraints, new_ab_eq_flags);
-
-        // access_tile_order and base_map keep the full base-memref rank.
-        mlir::AffineMap new_ab_order = addr_buf_at.getAccessTileOrder();
-        mlir::AffineMap new_ab_base_map =
-            mlir::AffineMap::getMultiDimIdentityMap(ab_num_dims, ctx);
-
-        // Result shape: dim k becomes 1 (pinned), others unchanged.
-        auto old_ab_type = mlir::cast<mlir::ktdp::AccessTileType>(
-            addr_buf_at.getResult().getType());
-        llvm::SmallVector<int64_t> new_ab_shape(old_ab_type.getShape().begin(),
-                                                old_ab_type.getShape().end());
-        new_ab_shape[pin_dim] = 1;
-        auto new_ab_type = mlir::ktdp::AccessTileType::get(
-            new_ab_shape, old_ab_type.getElementType());
-
-        // Indices: prior loop IVs for dims 0..k-1, current IV for dim k,
-        // %c0 for remaining dims.
-        mlir::OpBuilder ab_idx_b(addr_buf_at);
-        mlir::Value c0_ab =
-            mlir::arith::ConstantIndexOp::create(ab_idx_b, loc, 0).getResult();
-        llvm::SmallVector<mlir::Value> new_ab_indices(ab_num_dims, c0_ab);
-        for (unsigned d = 0; d < static_cast<unsigned>(k); ++d)
-          new_ab_indices[d] = window_ivs[d];
-        new_ab_indices[pin_dim] = for_op.getInductionVar();
-
-        mlir::OpBuilder ab_b(addr_buf_at);
-        auto new_addr_buf_at = mlir::ktdp::ConstructAccessTilesOp::create(
-            ab_b, addr_buf_at.getLoc(), new_ab_type, addr_buf_at.getBase(),
-            new_ab_base_map, new_ab_indices, new_ab_set, new_ab_order);
+        // Rebuild the addr_buf access tile keeping the full base-memref rank:
+        // on iteration k dim k is *pinned* to one element rather than dropped,
+        // giving shape [1, 32, ...] (dims 0..k-1 were already pinned by prior
+        // iterations).  See rebuildAccessTilePinned.
+        auto new_addr_buf_at = rebuildAccessTilePinned(
+            addr_buf_at, /*pin_dim=*/static_cast<unsigned>(k), window_ivs, loc,
+            ctx);
         pre_narrowed.push_back(new_addr_buf_at.getOperation());
+        llvm::ArrayRef<int64_t> new_ab_shape =
+            mlir::cast<mlir::ktdp::AccessTileType>(
+                new_addr_buf_at.getResult().getType())
+                .getShape();
 
         // Rebuild the fill load.  Its result type mirrors new_ab_shape.
         mlir::RankedTensorType old_fill_type = mlir::cast<mlir::RankedTensorType>(
@@ -1063,24 +1101,15 @@ static mlir::LogicalResult materializeWindowLoops(
         //
         // Reassociation: fold leading (ab_result_rank - new_iab_rank) pinned
         // dims plus the first free dim into one group; remaining dims 1:1.
-        //   e.g. k=0,W=1: ab=2, iab=1 → [[0,1]]
-        //        k=0,W=1: ab=2, iab=1 → [[0,1]]          → tensor<32xindex>
+        //   e.g. k=0,W=1: ab=2, iab=1 → [[0,1]]          → tensor<32xindex>
         //        k=0,W=2: ab=3, iab=2 → [[0,1],[2]]      → tensor<2x32xindex>
         //        k=1,W=2: ab=3, iab=1 → [[0,1,2]]        → tensor<32xindex>
-        unsigned ab_result_rank =
-            static_cast<unsigned>(new_ab_shape.size());
-        unsigned target_rank =
-            static_cast<unsigned>(new_iab_shape.size());
-        unsigned pinned_dims = ab_result_rank - target_rank;
-        mlir::SmallVector<mlir::ReassociationIndices> reassoc;
-        // First group: all pinned dims plus the first free dim.
-        mlir::ReassociationIndices first_group;
-        for (unsigned d = 0; d <= pinned_dims; ++d)
-          first_group.push_back(static_cast<int64_t>(d));
-        reassoc.push_back(first_group);
-        // Remaining groups: one dim each.
-        for (unsigned d = pinned_dims + 1; d < ab_result_rank; ++d)
-          reassoc.push_back({static_cast<int64_t>(d)});
+        unsigned ab_result_rank = static_cast<unsigned>(new_ab_shape.size());
+        unsigned target_rank = static_cast<unsigned>(new_iab_shape.size());
+        mlir::SmallVector<mlir::ReassociationIndices> reassoc =
+            makeLeadingFoldReassociation(
+                ab_result_rank,
+                /*folded_leading_dims=*/ab_result_rank - target_rank);
 
         auto flat_type = mlir::RankedTensorType::get(
             llvm::SmallVector<int64_t>(new_iab_shape.begin(),
@@ -1171,75 +1200,23 @@ static mlir::LogicalResult materializeWindowLoops(
             if (auto out_at = mlir::dyn_cast_if_present<mlir::ktdp::ConstructAccessTilesOp>(
                     out_store.getAccessTile().getDefiningOp())) {
               // ── Rebuild the output AT with pin-not-drop ─────────────────
-              mlir::IntegerSet old_out_set = out_at.getAccessTileSet().getValue();
-              unsigned out_num_dims = old_out_set.getNumDims();
-              unsigned out_pin_dim = static_cast<unsigned>(k);
-
-              // Replace upper-bound inequality on dim k with -d_k >= 0 (pin).
-              llvm::SmallVector<mlir::AffineExpr> new_out_constraints;
-              llvm::SmallVector<bool> new_out_eq_flags;
-              mlir::AffineExpr dk_out = mlir::getAffineDimExpr(out_pin_dim, ctx);
-              bool replaced_out_ub = false;
-              for (unsigned ci = 0; ci < old_out_set.getNumConstraints(); ++ci) {
-                mlir::AffineExpr c = old_out_set.getConstraint(ci);
-                bool is_eq = old_out_set.isEq(ci);
-                if (!is_eq && c.isFunctionOfDim(out_pin_dim) && !replaced_out_ub) {
-                  if (c != dk_out) {
-                    new_out_constraints.push_back(
-                        mlir::getAffineConstantExpr(0, ctx) - dk_out);
-                    new_out_eq_flags.push_back(false);
-                    replaced_out_ub = true;
-                    continue;
-                  }
-                }
-                new_out_constraints.push_back(c);
-                new_out_eq_flags.push_back(is_eq);
-              }
-              mlir::IntegerSet new_out_set = mlir::IntegerSet::get(
-                  out_num_dims, old_out_set.getNumSymbols(),
-                  new_out_constraints, new_out_eq_flags);
-
-              mlir::AffineMap new_out_order = out_at.getAccessTileOrder();
-              mlir::AffineMap new_out_base_map =
-                  mlir::AffineMap::getMultiDimIdentityMap(out_num_dims, ctx);
-
-              // Result shape: dim k becomes 1 (pinned), others unchanged.
-              auto old_out_type = mlir::cast<mlir::ktdp::AccessTileType>(
-                  out_at.getResult().getType());
-              llvm::SmallVector<int64_t> new_out_shape(
-                  old_out_type.getShape().begin(), old_out_type.getShape().end());
-              new_out_shape[out_pin_dim] = 1;
-              auto new_out_type = mlir::ktdp::AccessTileType::get(
-                  new_out_shape, old_out_type.getElementType());
-
-              // Indices: prior IVs at dims 0..k-1, current IV at dim k, c0 elsewhere.
-              mlir::OpBuilder out_idx_b(out_at);
-              mlir::Value c0_out =
-                  mlir::arith::ConstantIndexOp::create(out_idx_b, loc, 0).getResult();
-              llvm::SmallVector<mlir::Value> new_out_indices(out_num_dims, c0_out);
-              for (unsigned d = 0; d < static_cast<unsigned>(k); ++d)
-                new_out_indices[d] = window_ivs[d];
-              new_out_indices[out_pin_dim] = for_op.getInductionVar();
-
-              mlir::OpBuilder out_at_b(out_at);
-              auto new_out_at = mlir::ktdp::ConstructAccessTilesOp::create(
-                  out_at_b, out_at.getLoc(), new_out_type, out_at.getBase(),
-                  new_out_base_map, new_out_indices, new_out_set, new_out_order);
+              auto new_out_at = rebuildAccessTilePinned(
+                  out_at, /*pin_dim=*/static_cast<unsigned>(k), window_ivs, loc,
+                  ctx);
               pre_narrowed.push_back(new_out_at.getOperation());
+              llvm::ArrayRef<int64_t> new_out_shape =
+                  mlir::cast<mlir::ktdp::AccessTileType>(
+                      new_out_at.getResult().getType())
+                      .getShape();
 
-              // Build reassociation: fold the k+1 pinned leading dims (all 1) with
-              // the first free dim into one group; remaining dims are 1:1.
+              // Reassociation for the expand_shape that turns the drop-shaped
+              // compute result back into the pinned store operand: fold the k+1
+              // pinned leading dims (all 1) with the first free dim.
               // e.g. k=0: new_out_shape=[1,32,2,64]   → [[0,1],[2],[3]]
               //      k=1: new_out_shape=[1,1,32,2,64] → [[0,1,2],[3],[4]]
-              unsigned out_pinned_dims = static_cast<unsigned>(k + 1);
-              unsigned out_result_rank = static_cast<unsigned>(new_out_shape.size());
-              mlir::SmallVector<mlir::ReassociationIndices> out_reassoc;
-              mlir::ReassociationIndices first_out_group;
-              for (unsigned d = 0; d <= out_pinned_dims; ++d)
-                first_out_group.push_back(static_cast<int64_t>(d));
-              out_reassoc.push_back(first_out_group);
-              for (unsigned d = out_pinned_dims + 1; d < out_result_rank; ++d)
-                out_reassoc.push_back({static_cast<int64_t>(d)});
+              auto out_reassoc = makeLeadingFoldReassociation(
+                  static_cast<unsigned>(new_out_shape.size()),
+                  /*folded_leading_dims=*/static_cast<unsigned>(k + 1));
 
               mlir::Type out_elem_type = mlir::cast<mlir::RankedTensorType>(
                   out_store.getDataTile().getType()).getElementType();
@@ -1250,10 +1227,8 @@ static mlir::LogicalResult materializeWindowLoops(
               deferred_out_val = out_store.getDataTile();
               deferred_out_store = out_store;
               deferred_out_reassoc = out_reassoc;
-              deferred_out_pinned_type = mlir::RankedTensorType::get(
-                  llvm::SmallVector<int64_t>(new_out_shape.begin(),
-                                            new_out_shape.end()),
-                  out_elem_type);
+              deferred_out_pinned_type =
+                  mlir::RankedTensorType::get(new_out_shape, out_elem_type);
 
               // Mark the store as pre_narrowed so propagateNarrowing skips it.
               pre_narrowed.push_back(out_store.getOperation());
@@ -1296,69 +1271,23 @@ static mlir::LogicalResult materializeWindowLoops(
             if (auto src_at = mlir::dyn_cast_if_present<mlir::ktdp::ConstructAccessTilesOp>(
                     src_load.getAccessTile().getDefiningOp())) {
               // Found the indirect store source AT. Apply pin-not-drop.
-              mlir::IntegerSet old_src_set = src_at.getAccessTileSet().getValue();
-              unsigned src_num_dims = old_src_set.getNumDims();
-              unsigned src_pin_dim = static_cast<unsigned>(k);
-
-              // Replace upper-bound on dim k with -d_k >= 0 (pin).
-              llvm::SmallVector<mlir::AffineExpr> new_src_constraints;
-              llvm::SmallVector<bool> new_src_eq_flags;
-              mlir::AffineExpr dk_src = mlir::getAffineDimExpr(src_pin_dim, ctx);
-              bool replaced_src_ub = false;
-              for (unsigned ci = 0; ci < old_src_set.getNumConstraints(); ++ci) {
-                mlir::AffineExpr c = old_src_set.getConstraint(ci);
-                bool is_eq = old_src_set.isEq(ci);
-                if (!is_eq && c.isFunctionOfDim(src_pin_dim) && !replaced_src_ub) {
-                  if (c != dk_src) {
-                    new_src_constraints.push_back(
-                        mlir::getAffineConstantExpr(0, ctx) - dk_src);
-                    new_src_eq_flags.push_back(false);
-                    replaced_src_ub = true;
-                    continue;
-                  }
-                }
-                new_src_constraints.push_back(c);
-                new_src_eq_flags.push_back(is_eq);
-              }
-              mlir::IntegerSet new_src_set = mlir::IntegerSet::get(
-                  src_num_dims, old_src_set.getNumSymbols(),
-                  new_src_constraints, new_src_eq_flags);
-
-              mlir::AffineMap new_src_order = src_at.getAccessTileOrder();
-              mlir::AffineMap new_src_base_map =
-                  mlir::AffineMap::getMultiDimIdentityMap(src_num_dims, ctx);
-
-              // Result shape: pin dim k to 1, keep others.
-              auto old_src_type = mlir::cast<mlir::ktdp::AccessTileType>(
-                  src_at.getResult().getType());
-              llvm::SmallVector<int64_t> new_src_shape(
-                  old_src_type.getShape().begin(), old_src_type.getShape().end());
-              new_src_shape[src_pin_dim] = 1;
-              auto new_src_type = mlir::ktdp::AccessTileType::get(
-                  new_src_shape, old_src_type.getElementType());
-
-              // Indices: prior IVs at 0..k-1, current IV at k, c0 elsewhere.
-              mlir::OpBuilder src_idx_b(src_at);
-              mlir::Value c0_src =
-                  mlir::arith::ConstantIndexOp::create(src_idx_b, loc, 0).getResult();
-              llvm::SmallVector<mlir::Value> new_src_indices(src_num_dims, c0_src);
-              for (unsigned d = 0; d < static_cast<unsigned>(k); ++d)
-                new_src_indices[d] = window_ivs[d];
-              new_src_indices[src_pin_dim] = for_op.getInductionVar();
-
-              mlir::OpBuilder src_at_b(src_at);
-              auto new_src_at = mlir::ktdp::ConstructAccessTilesOp::create(
-                  src_at_b, src_at.getLoc(), new_src_type, src_at.getBase(),
-                  new_src_base_map, new_src_indices, new_src_set, new_src_order);
+              auto new_src_at = rebuildAccessTilePinned(
+                  src_at, /*pin_dim=*/static_cast<unsigned>(k), window_ivs, loc,
+                  ctx);
               pre_narrowed.push_back(new_src_at.getOperation());
+              llvm::ArrayRef<int64_t> new_src_shape =
+                  mlir::cast<mlir::ktdp::AccessTileType>(
+                      new_src_at.getResult().getType())
+                      .getShape();
+
+              mlir::Type src_elem_type = mlir::cast<mlir::RankedTensorType>(
+                  src_load.getResult().getType()).getElementType();
 
               // Rebuild the load from the pinned AT.
-              auto old_src_load_type = mlir::cast<mlir::RankedTensorType>(
-                  src_load.getResult().getType());
               mlir::OpBuilder sl_b(src_load);
               auto new_src_load = mlir::ktdp::LoadOp::create(
                   sl_b, src_load.getLoc(), new_src_at.getResult(),
-                  old_src_load_type.getElementType());
+                  src_elem_type);
               pre_narrowed.push_back(new_src_load.getOperation());
 
               // Insert collapse_shape: pinned load → drop-shaped ins.
@@ -1366,24 +1295,10 @@ static mlir::LogicalResult materializeWindowLoops(
               // e.g. k=0: new_src_shape=[1,32,2,64]   → [[0,1],[2],[3]]
               //      k=1: new_src_shape=[1,1,32,2,64] → [[0,1,2],[3],[4]]
               unsigned src_pinned_dims = static_cast<unsigned>(k + 1);
-              unsigned src_result_rank = static_cast<unsigned>(new_src_shape.size());
-              llvm::SmallVector<int64_t> src_drop_shape(
-                  new_src_shape.begin() + src_pinned_dims, new_src_shape.end());
-
-              mlir::SmallVector<mlir::ReassociationIndices> src_reassoc;
-              mlir::ReassociationIndices first_src_group;
-              for (unsigned d = 0; d <= src_pinned_dims; ++d)
-                first_src_group.push_back(static_cast<int64_t>(d));
-              src_reassoc.push_back(first_src_group);
-              for (unsigned d = src_pinned_dims + 1; d < src_result_rank; ++d)
-                src_reassoc.push_back({static_cast<int64_t>(d)});
-
-              mlir::Type src_elem_type = mlir::cast<mlir::RankedTensorType>(
-                  src_load.getResult().getType()).getElementType();
+              auto src_reassoc = makeLeadingFoldReassociation(
+                  static_cast<unsigned>(new_src_shape.size()), src_pinned_dims);
               auto src_collapsed_type = mlir::RankedTensorType::get(
-                  llvm::SmallVector<int64_t>(src_drop_shape.begin(),
-                                            src_drop_shape.end()),
-                  src_elem_type);
+                  new_src_shape.drop_front(src_pinned_dims), src_elem_type);
 
               mlir::OpBuilder cs_src_b(src_load->getNextNode());
               auto new_src_collapse = mlir::tensor::CollapseShapeOp::create(

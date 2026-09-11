@@ -6,30 +6,42 @@
 // the ind_addr_buf in one shot; Steps 2+3 (IndirectAddrBufLegalization) will
 // split it into per-row (window) and per-entry loops.
 //
-// After Step 2 the outer scf.for (window loop %i1) must wrap the access tile,
-// narrowing the IAB fill from 2×32 to a single 32-entry row slice.
-// After Step 3 an inner scf.for (per-entry loop %i2) further narrows to one
-// entry per iteration, guarded by scf.if (%i2 == 0) for the fill.
-//
-// Sub-step 2a (window loop materialization) is verified below.
-// Sub-step 2b (per-entry loop + scf.if guard) is not yet implemented.
+// Sub-step 2a materializes the outer window loop (%i1), narrowing the IAB
+// fill from 2×32 to a single 32-entry row slice per iteration.
+// Sub-step 2b materializes the inner per-entry loop (%i2), further narrowing
+// to one entry per iteration, with the ind_addr_buf fill guarded by
+// scf.if (%i2 == 0) and the ind_addr_buf memref threaded as an iter-arg.
 
 // CHECK-LABEL: func.func @local_schedule_1
-// CHECK:         scf.for [[IV:%arg[0-9]+]] = {{.*}} to %c2 step
-// CHECK:           ktdp.construct_access_tile {{.*}}{{\[}}[[IV]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x32xindex>
-// CHECK:           ktdp.load {{.*}} <1x32xindex> -> tensor<1x32xindex>
-// CHECK:           ktdp_lowering.construct_memory_view {{.*}} sizes: [32],
+// CHECK:         scf.for [[I1:%arg[0-9]+]] = {{.*}} to %c2 step
+// Sub-step 2b: sentinel outside the inner loop, iter-arg threading.
+// CHECK:           [[SENTINEL:%.+]] = ktdp_lowering.construct_memory_view %c0, sizes: [32],
 // CHECK-SAME:        memory_space = "IAB"
-// CHECK:           tensor.collapse_shape {{.*}} {{\[\[}}0, 1{{\]\]}}
-// CHECK-SAME:        tensor<1x32xindex> into tensor<32xindex>
-// CHECK:           ktdp_lowering.construct_indirect_access_tile
-// CHECK-SAME:        -> !ktdp.access_tile<32x2x64xindex>
-// CHECK:           ktdp.load {{.*}} <32x2x64xindex> -> tensor<32x2x64xf16>
-// CHECK:           linalg.generic
-// CHECK-SAME:        iterator_types = ["parallel", "parallel", "parallel"]
-// CHECK:           tensor.expand_shape {{.*}} {{\[\[}}0, 1{{.*}}tensor<32x2x64xf16> into tensor<1x32x2x64xf16>
-// CHECK:           ktdp.construct_access_tile {{.*}}{{\[}}[[IV]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x32x2x64xindex>
-// CHECK:           ktdp.store {{.*}} tensor<1x32x2x64xf16>, <1x32x2x64xindex>
+// CHECK:           scf.for [[I2:%arg[0-9]+]] = %c0{{.*}} to %c32 step %c1
+// CHECK-SAME:          iter_args(%{{.*}} = [[SENTINEL]]) -> (memref<32xindex, "IAB">)
+// CHECK:             [[EQ0:%.+]] = arith.cmpi eq, [[I2]], %c0
+// CHECK:             [[IABMV:%.+]] = scf.if [[EQ0]] -> (memref<32xindex, "IAB">) {
+// CHECK:               ktdp.construct_access_tile {{.*}}{{\[}}[[I1]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x32xindex>
+// CHECK:               ktdp.load {{.*}} <1x32xindex> -> tensor<1x32xindex>
+// CHECK:               tensor.collapse_shape {{.*}} {{\[\[}}0, 1{{\]\]}}
+// CHECK-SAME:            tensor<1x32xindex> into tensor<32xindex>
+// CHECK:               ktdp_lowering.construct_memory_view %c0, sizes: [32],
+// CHECK-SAME:            memory_space = "IAB"
+// CHECK:               ktdp.store {{.*}} tensor<32xindex>, <32xindex>
+// CHECK:               scf.yield
+// CHECK:             } else {
+// CHECK:               scf.yield
+// CHECK:             }
+// CHECK:             ktdp_lowering.construct_indirect_access_tile
+// CHECK-SAME:            base_ptr = [[IABMV]][[[I2]]]
+// CHECK-SAME:            -> !ktdp.access_tile<2x64xindex>
+// CHECK:             ktdp.load {{.*}} <2x64xindex> -> tensor<2x64xf16>
+// CHECK:             linalg.generic
+// CHECK-SAME:            iterator_types = ["parallel", "parallel"]
+// CHECK:             tensor.expand_shape {{.*}} tensor<2x64xf16> into tensor<1x1x2x64xf16>
+// CHECK:             ktdp.construct_access_tile {{.*}}{{\[}}[[I1]], [[I2]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x2x64xindex>
+// CHECK:             ktdp.store {{.*}} tensor<1x1x2x64xf16>, <1x1x2x64xindex>
+// CHECK:             scf.yield [[IABMV]]
 // CHECK:         } {loop_type = #ktdf.loop_type<parallel_loop>}
 
 #set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 63 >= 0)>

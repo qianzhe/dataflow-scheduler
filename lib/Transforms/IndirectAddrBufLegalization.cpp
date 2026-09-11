@@ -42,6 +42,7 @@
 #include "mlir/IR/IntegerSet.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 #define PASS_NAME "indirect-addr-buf-legalization"
 #define DEBUG_TYPE PASS_NAME
@@ -1472,6 +1473,322 @@ materializeWindowLoops(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
   return std::make_pair(current_op, window_ivs);
 }
 
+/// Sub-step 2b: materialise the per-entry scf.for over individual
+/// ind_addr_buf entries.  Runs once, after materializeWindowLoops has
+/// absorbed every window dimension; `window_ivs` is whatever that call
+/// returned (empty when sub-step 2a was a W == 0 no-op).
+///
+/// Unlike the window loops, the IAB memref's rank does not change here — it
+/// stays 1-D, size iab_size.  What changes is how that view is produced: the
+/// ind_addr_buf fill chain (relocated, unmodified, from the rest of the body)
+/// only runs on the first iteration (%i2 == 0), gated by an scf.if, with the
+/// resulting view threaded through the loop as an iter-arg.
+static mlir::LogicalResult materializeEntryLoop(
+    mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
+    llvm::ArrayRef<mlir::Value> window_ivs, int64_t iab_size) {
+  mlir::MLIRContext* ctx = op.getContext();
+  mlir::Location loc = op.getLoc();
+  mlir::ktdp_lowering::ConstructIndirectAccessTileOp current_op = op;
+
+  // ── Step 1: identify the entry variable and its trip count ─────────────
+  auto absorbed_info = getAbsorbedVarInfo(current_op);
+  if (mlir::failed(absorbed_info)) return mlir::failure();
+  int64_t N = absorbed_info->trip_count;
+  if (N != iab_size) {
+    current_op.emitError() << "entry dimension trip count (" << N
+                           << ") does not equal hardware IAB size ("
+                           << iab_size << ")";
+    return mlir::failure();
+  }
+
+  // ── Step 2: splice boundary ──────────────────────────────────────────────
+  bool is_first_loop = window_ivs.empty();
+  mlir::Block* src_block = current_op->getBlock();
+  auto [splice_begin_op, splice_end_op] =
+      computeSpliceBoundary(current_op, is_first_loop);
+  if (!splice_begin_op || !splice_end_op) {
+    current_op.emitError()
+        << "could not determine splice boundary for entry loop";
+    return mlir::failure();
+  }
+
+  // ── Step 3: capture the current (rank-1) IAB memref op ──────────────────
+  auto cur_iab_mv = mlir::cast<mlir::ktdp_lowering::ConstructMemoryViewOp>(
+      current_op.getIndAddrBufMemref().getDefiningOp());
+  mlir::MemRefType iab_mv_type =
+      mlir::cast<mlir::MemRefType>(cur_iab_mv.getResult().getType());
+
+  // Build an identical (but distinct) ConstructMemoryViewOp at the given
+  // builder's insertion point.  Used for both the outer sentinel and the
+  // then-local fill target — same attributes as cur_iab_mv, never narrowed.
+  auto cloneIabMv = [&](mlir::OpBuilder& b) {
+    return mlir::ktdp_lowering::ConstructMemoryViewOp::create(
+        b, loc, iab_mv_type, cur_iab_mv.getOffset(),
+        /*sizes=*/mlir::ValueRange{}, /*strides=*/mlir::ValueRange{},
+        cur_iab_mv.getStaticSizes(), cur_iab_mv.getStaticStrides(),
+        cur_iab_mv.getMemorySpace(), cur_iab_mv.getCoordinateSet());
+  };
+
+  // ── Step 4: emit c0/cN/c1, the sentinel, and the scf.for with iter_args ─
+  mlir::OpBuilder builder(splice_begin_op);
+  mlir::Value c0 =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  mlir::Value cN =
+      mlir::arith::ConstantIndexOp::create(builder, loc, N).getResult();
+  mlir::Value c1 =
+      mlir::arith::ConstantIndexOp::create(builder, loc, 1).getResult();
+  auto iab_mv_init = cloneIabMv(builder);
+
+  // No loop_type annotation: unlike window loops, this loop carries state
+  // across iterations via the iter-arg, so parallel_loop does not apply.
+  auto for_op = mlir::scf::ForOp::create(builder, loc, c0, cN, c1,
+                                        mlir::ValueRange{iab_mv_init.getResult()});
+  mlir::Value i2 = for_op.getInductionVar();
+  mlir::Value iab_mv_carry = for_op.getRegionIterArg(0);
+
+  llvm::SmallVector<mlir::Value> entry_ivs(window_ivs.begin(), window_ivs.end());
+  entry_ivs.push_back(i2);
+  unsigned pin_dim = static_cast<unsigned>(window_ivs.size());
+
+  mlir::Block* dst_block = for_op.getBody();
+
+  // ── Step 5: splice [splice_begin_op, splice_end_op] into the for body ───
+  // The for body has no terminator yet (scf::ForOp with iter_args and no
+  // bodyBuilder leaves that to the caller), so the spliced content simply
+  // becomes the block's entire (as yet unterminated) contents.
+  mlir::Block::iterator splice_begin = splice_begin_op->getIterator();
+  mlir::Block::iterator splice_end = std::next(splice_end_op->getIterator());
+  dst_block->getOperations().splice(dst_block->begin(), src_block->getOperations(),
+                                    splice_begin, splice_end);
+
+  // ── Step 6/7: build the scf.if guard and relocate the fill chain ────────
+  // Insert `%eq0 = arith.cmpi eq, %i2, %c0` and the scf.if at the very front
+  // of dst_block — everything currently there (the just-spliced body) ends
+  // up after it, matching the design doc's IR shape.
+  mlir::OpBuilder front_builder(dst_block, dst_block->begin());
+  mlir::Value eq0 = mlir::arith::CmpIOp::create(
+      front_builder, loc, mlir::arith::CmpIPredicate::eq, i2, c0)
+                        .getResult();
+  auto if_op = mlir::scf::IfOp::create(front_builder, loc,
+                                       mlir::TypeRange{iab_mv_type}, eq0,
+                                       /*withElseRegion=*/true);
+  mlir::Block& then_block = if_op.getThenRegion().front();
+  mlir::Block& else_block = if_op.getElseRegion().front();
+
+  auto fill_chains =
+      findIabFillChains(cur_iab_mv.getResult(), current_op.getOperation());
+  if (fill_chains.size() != 1 || fill_chains.front().links.size() != 1) {
+    current_op.emitError()
+        << "expected exactly one ind_addr_buf fill chain for sub-step 2b, "
+           "found "
+        << fill_chains.size() << " access tile(s) on the IAB memref";
+    return mlir::failure();
+  }
+  IabFillChain& chain = fill_chains.front();
+  IabFillLink& link = chain.links.front();
+  if (!link.fill_load || !link.addr_buf_at) {
+    current_op.emitError() << "could not discover the addr_buf load feeding "
+                              "the ind_addr_buf fill";
+    return mlir::failure();
+  }
+
+  // Move the upstream fill-prep ops (addr_buf AT, load, any collapse) into
+  // `then` first, in their original relative block order.  Each of these
+  // ops may have its own dedicated index/constant operands (e.g. the %c0
+  // rebuildAccessTilePinned or narrowOp created immediately before it) that
+  // are not part of the chain itself but must move along with it — moving
+  // only the named op would strand such a private operand outside `then`,
+  // after `if_op`, breaking dominance.  Close over every dst_block op whose
+  // *every* use is already in the moving set (transitively) to catch these.
+  auto closeOverPrivateOperands =
+      [&](llvm::SmallPtrSetImpl<mlir::Operation*>& to_move) {
+        bool changed = true;
+        while (changed) {
+          changed = false;
+          for (mlir::Operation* op :
+               llvm::SmallVector<mlir::Operation*>(to_move.begin(), to_move.end())) {
+            for (mlir::Value operand : op->getOperands()) {
+              mlir::Operation* def = operand.getDefiningOp();
+              if (!def || def->getBlock() != dst_block || to_move.count(def))
+                continue;
+              if (llvm::all_of(def->getUsers(), [&](mlir::Operation* user) {
+                    return to_move.count(user);
+                  })) {
+                to_move.insert(def);
+                changed = true;
+              }
+            }
+          }
+        }
+      };
+
+  llvm::SmallPtrSet<mlir::Operation*, 4> upstream_ops;
+  upstream_ops.insert(link.addr_buf_at.getOperation());
+  upstream_ops.insert(link.fill_load.getOperation());
+  for (auto collapse : link.prior_collapses)
+    upstream_ops.insert(collapse.getOperation());
+  closeOverPrivateOperands(upstream_ops);
+  for (mlir::Operation& blk_op : llvm::make_early_inc_range(*dst_block)) {
+    if (upstream_ops.count(&blk_op))
+      blk_op.moveBefore(&then_block, then_block.end());
+  }
+
+  // Then-local IAB memref clone: the fill's target, distinct from the outer
+  // sentinel (`iab_mv_init`) — matches the design doc's separate `%iab_mv_`.
+  mlir::OpBuilder then_clone_b(&then_block, then_block.end());
+  auto iab_mv_then = cloneIabMv(then_clone_b);
+
+  // Redirect the fill AT's base operand to the then-local clone — no shape
+  // or attribute change, so an operand swap is enough — then move the AT
+  // (and any of its own private operands) and its store after the clone.
+  chain.iab_at.getBaseMutable().assign(iab_mv_then.getResult());
+  llvm::SmallPtrSet<mlir::Operation*, 4> at_store_ops;
+  at_store_ops.insert(chain.iab_at.getOperation());
+  at_store_ops.insert(link.fill_store.getOperation());
+  closeOverPrivateOperands(at_store_ops);
+  for (mlir::Operation& blk_op : llvm::make_early_inc_range(*dst_block)) {
+    if (at_store_ops.count(&blk_op))
+      blk_op.moveBefore(&then_block, then_block.end());
+  }
+
+  mlir::OpBuilder then_yield_b(&then_block, then_block.end());
+  mlir::scf::YieldOp::create(then_yield_b, loc,
+                             mlir::ValueRange{iab_mv_then.getResult()});
+  mlir::OpBuilder else_yield_b(&else_block, else_block.end());
+  mlir::scf::YieldOp::create(else_yield_b, loc, mlir::ValueRange{iab_mv_carry});
+
+  // ── Step 8: rewire the rest of the body to the scf.if's result ─────────
+  cur_iab_mv.getResult().replaceAllUsesWith(if_op.getResult(0));
+  cur_iab_mv.erase();
+
+  // ── Classify indirect load vs indirect store, as in sub-step 2a ─────────
+  bool is_indirect_load = false;
+  bool is_indirect_store = false;
+  for (mlir::Operation* user : current_op.getResult().getUsers()) {
+    if (mlir::isa<mlir::ktdp::LoadOp>(user))
+      is_indirect_load = true;
+    else if (mlir::isa<mlir::ktdp::StoreOp>(user))
+      is_indirect_store = true;
+  }
+
+  // ── Step 9: pin-not-drop for descriptor ATs ─────────────────────────────
+  llvm::SmallVector<mlir::Operation*> pre_narrowed;
+  std::optional<DeferredExpand> deferred_out;
+  if (is_indirect_load) {
+    deferred_out = pinOutputDescriptorAT(current_op, dst_block, pin_dim,
+                                         entry_ivs, pre_narrowed, loc, ctx);
+  }
+  if (is_indirect_store) {
+    pinSourceDescriptorAT(current_op, dst_block, pin_dim, entry_ivs,
+                          pre_narrowed, loc, ctx);
+  }
+
+  // ── Step 10: rebuild construct_indirect_access_tile ─────────────────────
+  // Unlike sub-step 2a (which purely drops the absorbed dim), sub-step 2b
+  // *relocates* the entry variable: it leaves the intermediate-variable
+  // space and becomes a new captured variable (%i2), since the IAB memref
+  // stays rank 1 and its verifier requires ind_addr_buf_dim_positions to
+  // have exactly one entry.  %i2 is appended right after the existing
+  // captured variables, at unified position `num_captured`.
+  unsigned num_captured = absorbed_info->num_captured;
+  unsigned absorbed_unified_dim = num_captured + absorbed_info->absorbed_interm_idx;
+  unsigned tile_dim_to_drop = absorbed_info->tile_dim_to_drop;
+
+  mlir::IntegerSet new_vars_set = dropDimFromIntegerSet(
+      current_op.getVariablesSpaceSet().getValue(),
+      absorbed_info->absorbed_interm_idx);
+  mlir::AffineMap new_vars_order = dropDimFromAffineMap(
+      current_op.getVariablesSpaceOrder(), absorbed_info->absorbed_interm_idx);
+
+  unsigned new_num_interm =
+      static_cast<unsigned>(current_op.getIntermediateVariables().size()) - 1;
+
+  llvm::SmallVector<mlir::Value> captured_vars(
+      current_op.getCapturedVariables().begin(),
+      current_op.getCapturedVariables().end());
+  captured_vars.push_back(i2);
+  llvm::SmallVector<int32_t> new_iab_positions = {
+      static_cast<int32_t>(num_captured)};
+
+  // per_dim_subscript_maps' domain dimension *count* is unchanged: one
+  // intermediate dim is removed, one captured dim is inserted, so the
+  // unified total (captured + intermediate) stays the same.  The absorbed
+  // dim itself is never referenced (an ind()-selecting variable is excluded
+  // from direct per-dim subscripts by construction — see the op's
+  // description), so only dims strictly between the insertion point
+  // (num_captured) and the absorbed slot (absorbed_unified_dim) need to
+  // shift, to make room for the newly-inserted %i2 at num_captured. That
+  // range is empty whenever the entry variable is the first remaining
+  // intermediate variable (the frontend's convention: IAB-related
+  // intermediate variables always precede direct ones), so in practice this
+  // is a no-op; the general shift is implemented so it stays correct if
+  // that convention ever changes.
+  llvm::SmallVector<mlir::Attribute> new_subscript_maps;
+  for (mlir::Attribute attr : current_op.getPerDimSubscriptMaps()) {
+    mlir::AffineMap old_map = mlir::cast<mlir::AffineMapAttr>(attr).getValue();
+    unsigned old_num_dims = old_map.getNumDims();
+    llvm::SmallVector<mlir::AffineExpr> dim_repls(old_num_dims);
+    for (unsigned d = 0; d < old_num_dims; ++d) {
+      if (d == absorbed_unified_dim)
+        dim_repls[d] = mlir::getAffineConstantExpr(0, ctx);  // never referenced
+      else if (d >= num_captured && d < absorbed_unified_dim)
+        dim_repls[d] = mlir::getAffineDimExpr(d + 1, ctx);
+      else
+        dim_repls[d] = mlir::getAffineDimExpr(d, ctx);
+    }
+    llvm::SmallVector<mlir::AffineExpr> new_results;
+    for (unsigned r = 0; r < old_map.getNumResults(); ++r)
+      new_results.push_back(
+          old_map.getResult(r).replaceDimsAndSymbols(dim_repls, {}));
+    new_subscript_maps.push_back(mlir::AffineMapAttr::get(mlir::AffineMap::get(
+        old_num_dims, old_map.getNumSymbols(), new_results, ctx)));
+  }
+
+  mlir::Value base = current_op.getBase();
+
+  auto cur_result_type =
+      mlir::cast<mlir::ktdp::AccessTileType>(current_op.getResult().getType());
+  llvm::SmallVector<int64_t> new_result_shape =
+      dropShapeDim(cur_result_type.getShape(), tile_dim_to_drop);
+  auto new_result_type = mlir::ktdp::AccessTileType::get(
+      new_result_shape, cur_result_type.getElementType());
+
+  mlir::OpBuilder replace_builder(current_op);
+  auto new_op = mlir::ktdp_lowering::ConstructIndirectAccessTileOp::create(
+      replace_builder, loc, new_result_type, base, if_op.getResult(0),
+      mlir::DenseI32ArrayAttr::get(ctx, new_iab_positions),
+      mlir::ArrayAttr::get(ctx, new_subscript_maps), captured_vars,
+      new_num_interm, new_vars_order, new_vars_set);
+
+  current_op.getResult().replaceAllUsesWith(new_op.getResult());
+  current_op.erase();
+  current_op = new_op;
+
+  // ── Step 11: propagate the narrowed shape through the compute chain ────
+  if (mlir::failed(propagateNarrowing(new_op, tile_dim_to_drop, entry_ivs,
+                                      /*iab_rank=*/1, pre_narrowed, loc, ctx)))
+    return mlir::failure();
+
+  // ── Step 12: insert the deferred expand_shape, same as sub-step 2a ─────
+  if (deferred_out) {
+    mlir::OpBuilder es_b(deferred_out->src_val.getDefiningOp()
+                             ? deferred_out->src_val.getDefiningOp()->getNextNode()
+                             : deferred_out->store.getOperation());
+    auto out_expand = mlir::tensor::ExpandShapeOp::create(
+        es_b, deferred_out->store.getLoc(), deferred_out->pinned_type,
+        deferred_out->src_val, deferred_out->reassoc);
+    deferred_out->store.getDataTileMutable().assign(out_expand.getResult());
+  }
+
+  // Terminate the scf.for body: carry the scf.if's result to the next
+  // iteration's iter-arg.
+  mlir::OpBuilder for_yield_b(dst_block, dst_block->end());
+  mlir::scf::YieldOp::create(for_yield_b, loc,
+                             mlir::ValueRange{if_op.getResult(0)});
+
+  return mlir::success();
+}
+
 struct IndirectAddrBufLegalizationPass
     : public impl::IndirectAddrBufLegalizationPassBase<
           IndirectAddrBufLegalizationPass> {
@@ -1542,15 +1859,12 @@ struct IndirectAddrBufLegalizationPass
         signalPassFailure();
         return;
       }
-      // win_result->first / win_result->second (final op, accumulated window
-      // IVs) will feed materializeEntryLoop once sub-step 2b lands.
+      if (mlir::failed(materializeEntryLoop(win_result->first,
+                                            win_result->second, iab_size))) {
+        signalPassFailure();
+        return;
+      }
     }
-
-    // TODO(sub-step-2b): materialize inner scf.for over ind_addr_buf entries;
-    // gate ind_addr_buf fill with scf.if (%i2 == 0); thread ind_addr_buf
-    // memref view as scf.for iter-arg (sentinel initial value outside, real
-    // view yielded from scf.if); remove absorbed intermediate variable from
-    // the hidden region and variables_space_set.
   }
 };
 

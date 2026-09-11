@@ -12,27 +12,46 @@
 //     result !ktdp.access_tile<1x1x32xindex>, collapse_shape [[0,1,2]] →
 //     tensor<32xindex> (replaces the k=0 collapse).
 //   - IAB memref finally rank-1: memref<32xindex, "IAB">.
-//   - indirect access tile result: 32×2×64.
-//   - The linalg.generic and source-data load appear inside the inner for,
-//     before the addr_buf fill (scatter order).
+// After sub-step 2b, a third loop (%i3) absorbs the remaining per-entry
+// dimension (0..31), guarded by scf.if (%i3 == 0), with the IAB memref
+// threaded as an iter-arg. The source-tile load and compute (independent of
+// the IAB) end up after the scf.if guard, still inside the entry loop —
+// indirect access tile result finally 2×64.
 
 // CHECK-LABEL: func.func @local_schedule_1
 // CHECK:         scf.for [[IV0:%arg[0-9]+]] = {{.*}} to %c3 step
 // CHECK:           scf.for [[IV1:%arg[0-9]+]] = {{.*}} to %c2 step
-// CHECK:             ktdp.construct_access_tile {{.*}}{{\[}}[[IV0]], [[IV1]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x32x2x64xindex>
-// CHECK:             ktdp.load {{.*}} <1x1x32x2x64xindex> -> tensor<1x1x32x2x64xf16>
-// CHECK:             tensor.collapse_shape {{.*}} {{\[\[}}0, 1, 2{{.*}}tensor<1x1x32x2x64xf16> into tensor<32x2x64xf16>
-// CHECK:             linalg.generic
-// CHECK-SAME:          iterator_types = ["parallel", "parallel", "parallel"]
-// CHECK:             ktdp.construct_access_tile {{.*}}{{\[}}[[IV0]], [[IV1]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x32xindex>
-// CHECK:             ktdp.load {{.*}} <1x1x32xindex> -> tensor<1x1x32xindex>
-// CHECK:             ktdp_lowering.construct_memory_view {{.*}} sizes: [32],
+// Sub-step 2b: sentinel outside the inner (entry) loop, iter-arg threading.
+// CHECK:             [[SENTINEL:%.+]] = ktdp_lowering.construct_memory_view %c0, sizes: [32],
 // CHECK-SAME:          memory_space = "IAB"
-// CHECK:             tensor.collapse_shape {{.*}} {{\[\[}}0, 1, 2{{\]\]}}
-// CHECK-SAME:          tensor<1x1x32xindex> into tensor<32xindex>
-// CHECK:             ktdp_lowering.construct_indirect_access_tile
-// CHECK-SAME:          -> !ktdp.access_tile<32x2x64xindex>
-// CHECK:             ktdp.store {{.*}} tensor<32x2x64xf16>, <32x2x64xindex>
+// CHECK:             scf.for [[IV2:%arg[0-9]+]] = %c0{{.*}} to %c32 step %c1
+// CHECK-SAME:            iter_args(%{{.*}} = [[SENTINEL]]) -> (memref<32xindex, "IAB">)
+// CHECK:               [[EQ0:%.+]] = arith.cmpi eq, [[IV2]], %c0
+// CHECK:               [[IABMV:%.+]] = scf.if [[EQ0]] -> (memref<32xindex, "IAB">) {
+// CHECK:                 ktdp.construct_access_tile {{.*}}{{\[}}[[IV0]], [[IV1]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x32xindex>
+// CHECK:                 ktdp.load {{.*}} <1x1x32xindex> -> tensor<1x1x32xindex>
+// CHECK:                 tensor.collapse_shape {{.*}} {{\[\[}}0, 1, 2{{\]\]}}
+// CHECK-SAME:              tensor<1x1x32xindex> into tensor<32xindex>
+// CHECK:                 ktdp_lowering.construct_memory_view %c0, sizes: [32],
+// CHECK-SAME:              memory_space = "IAB"
+// CHECK:                 ktdp.store {{.*}} tensor<32xindex>, <32xindex>
+// CHECK:                 scf.yield
+// CHECK:               } else {
+// CHECK:                 scf.yield
+// CHECK:               }
+// Source-tile load + compute: independent of the IAB, so it ends up after
+// the scf.if guard rather than before it.
+// CHECK:               ktdp.construct_access_tile {{.*}}{{\[}}[[IV0]], [[IV1]], [[IV2]], {{.*}}{{\]}} {{.*}} -> !ktdp.access_tile<1x1x1x2x64xindex>
+// CHECK:               ktdp.load {{.*}} <1x1x1x2x64xindex> -> tensor<1x1x1x2x64xf16>
+// CHECK:               tensor.collapse_shape {{.*}} {{\[\[}}0, 1, 2, 3{{.*}}tensor<1x1x1x2x64xf16> into tensor<2x64xf16>
+// CHECK:               linalg.generic
+// CHECK-SAME:            iterator_types = ["parallel", "parallel"]
+// CHECK:               ktdp_lowering.construct_indirect_access_tile
+// CHECK-SAME:              base_ptr = [[IABMV]][[[IV2]]]
+// CHECK-SAME:              -> !ktdp.access_tile<2x64xindex>
+// CHECK:               ktdp.store {{.*}} tensor<2x64xf16>, <2x64xindex>
+// CHECK:               scf.yield [[IABMV]]
+// CHECK:             }
 // CHECK:           } {loop_type = #ktdf.loop_type<parallel_loop>}
 // CHECK:         } {loop_type = #ktdf.loop_type<parallel_loop>}
 

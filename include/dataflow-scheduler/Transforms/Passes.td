@@ -565,4 +565,28 @@ def IndirectAddrBufLegalizationPass
   ];
 }
 
+def IndirectAccessLoopMaterializationPass
+    : Pass<"indirect-access-loop-materialization", "mlir::ModuleOp"> {
+  let summary = "Materialize loops for non-contiguous direct subscripts of "
+                "indirect access tiles";
+  let description = [{
+    Inspects the remaining direct-subscript intermediate variables of each
+    ktdp_lowering.construct_indirect_access_tile. A variable is materialized
+    into a scf.for loop when its dimension fails the dense-packing condition
+    (stride[k] != size[k+1]*stride[k+1], or stride != 1 for the innermost
+    dimension of $base) OR the full-coverage condition (variables_space_set
+    bound < dimension size). Variables that satisfy both conditions are
+    retained so that ConstructThreeStagePipeline can read the per-transfer
+    tile size. Materialized loops are annotated parallel_loop.
+    No-op when all remaining variables satisfy both conditions, or when no
+    ktdp_lowering.construct_indirect_access_tile is present.
+  }];
+  let constructor = "::scheduler::createIndirectAccessLoopMaterializationPass()";
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::ktdf::KTDFDialect"
+  ];
+}
+
 #endif // DATAFLOW_SCHEDULER_TRANSFORMS_PASSES_TD

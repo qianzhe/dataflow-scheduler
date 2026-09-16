@@ -209,12 +209,19 @@ std::pair<mlir::Operation*, mlir::Operation*> findSpliceBoundary(
     }
   }
 
-  // Scan the block in order to find the boundary ops.
-  mlir::Operation* splice_begin = nullptr;  // earliest construct_access_tile
-  mlir::Operation* splice_end = nullptr;    // latest ktdp.store
+  // Scan the block in order to find the boundary ops: the earliest
+  // ktdp.construct_access_tile (the addr_buf fill AT in gather, the source
+  // AT in scatter, both of which precede indirect_op in the pre-legalization
+  // IR this function is called on) and the latest ktdp.store, among the
+  // visited set. Leaving either null when not found (rather than falling
+  // back to indirect_op itself) lets the caller's own null-check surface a
+  // violation of that invariant as a pass error instead of silently
+  // splicing an incorrect range.
+  mlir::Operation* splice_begin = nullptr;
+  mlir::Operation* splice_end = nullptr;  // latest ktdp.store
   for (mlir::Operation& blk_op : *block) {
     if (!visited.count(&blk_op)) continue;
-    if (mlir::isa<mlir::ktdp::ConstructAccessTilesOp>(&blk_op) && !splice_begin)
+    if (!splice_begin && mlir::isa<mlir::ktdp::ConstructAccessTilesOp>(&blk_op))
       splice_begin = &blk_op;
     if (mlir::isa<mlir::ktdp::StoreOp>(&blk_op)) splice_end = &blk_op;
   }

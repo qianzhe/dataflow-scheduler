@@ -34,6 +34,8 @@
 
 #include "dataflow-scheduler/Dialect/KTDPLowering/KTDPLowering.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Block.h"
@@ -44,16 +46,13 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LLVM.h"
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/SmallVector.h"
 
 namespace scheduler {
 
 /// Drop dimension `drop_dim` from `set` (which has `orig_num_dims` dimensions).
 /// Constraints that reference `drop_dim` are removed; the remaining dimensions
 /// above `drop_dim` are shifted down by one.
-mlir::IntegerSet dropDimFromIntegerSet(mlir::IntegerSet set,
-                                       unsigned drop_dim);
+mlir::IntegerSet dropDimFromIntegerSet(mlir::IntegerSet set, unsigned drop_dim);
 
 /// Pin dimension `pin_dim` of `set` to the single value 0 by replacing its
 /// upper-bound inequality (`-d_k + (N-1) >= 0`) with `-d_k >= 0`. The
@@ -123,11 +122,15 @@ mlir::ktdp::ConstructAccessTilesOp rebuildAccessTilePinned(
 ///         then UP from each user's non-indirect operands (pulls in the
 ///         indirect store source-data chain that is only reachable downstream).
 ///
-/// Returns {splice_begin_op, splice_end_op}: the earliest
-/// ktdp.construct_access_tile and the latest ktdp.store in block order
-/// among the collected set. Both are guaranteed to be non-null because
-/// the input MLIR is in the canonical "indirect_load + compute + store"
-/// form.
+/// Returns {splice_begin_op, splice_end_op}: the earliest of {a
+/// ktdp.construct_access_tile, indirect_op itself} and the latest
+/// ktdp.store in block order among the collected set. The fallback to
+/// indirect_op itself covers callers running after an earlier pass has
+/// already relocated any preceding fill-chain construct_access_tile
+/// elsewhere (e.g. behind a guarded scf.if), leaving indirect_op as the
+/// earliest relevant op in this block. Both are guaranteed to be non-null
+/// because the input MLIR is in the canonical "indirect_load + compute +
+/// store" form.
 std::pair<mlir::Operation*, mlir::Operation*> findSpliceBoundary(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp indirect_op);
 

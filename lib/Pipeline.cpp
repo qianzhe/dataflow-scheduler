@@ -50,6 +50,7 @@ void scheduler::buildKTIRFrontendPipeline(
   pm.addPass(createComputeGroupExtractionPass());
   // TODO(Phase1): pm.addPass(createIndirectComputeGroupSplitPass());
   // TODO(Phase2): pm.addPass(createIndirectAddrBufLegalizationPass());
+  // TODO(Phase3): pm.addPass(createIndirectAccessLoopMaterializationPass());
   pm.addPass(createConstructThreeStagePipelinePass(scheduler_ctx));
 }
 

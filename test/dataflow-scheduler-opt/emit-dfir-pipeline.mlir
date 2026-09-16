@@ -21,6 +21,7 @@
 // CHECK-NEXT:   compute-group-extraction
 // CHECK-NEXT:   indirect-compute-group-split
 // CHECK-NEXT:   indirect-addr-buf-legalization
+// CHECK-NEXT:   indirect-access-loop-materialization
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
 // CHECK-NEXT:   convert-elementwise-to-linalg,

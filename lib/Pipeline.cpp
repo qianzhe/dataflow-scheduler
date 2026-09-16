@@ -51,6 +51,7 @@ void scheduler::buildKTIRFrontendPipeline(
   pm.addPass(createComputeGroupExtractionPass());
   pm.addPass(createIndirectComputeGroupSplitPass());
   pm.addPass(createIndirectAddrBufLegalizationPass());
+  pm.addPass(createIndirectAccessLoopMaterializationPass());
   {
     auto& nested = pm.nest<mlir::ModuleOp>().nest<mlir::func::FuncOp>();
     nested.addPass(mlir::createConvertElementwiseToLinalgPass());

@@ -122,15 +122,17 @@ mlir::SmallVector<mlir::ReassociationIndices> makeLeadingFoldReassociation(
   return reassoc;
 }
 
-mlir::ktdp::ConstructAccessTilesOp rebuildAccessTilePinned(
-    mlir::ktdp::ConstructAccessTilesOp at, unsigned pin_dim,
-    llvm::ArrayRef<mlir::Value> window_ivs, mlir::Location loc,
-    mlir::MLIRContext* ctx) {
-  assert(pin_dim + 1 == window_ivs.size() &&
-         "pin_dim must index the innermost window loop IV");
+mlir::FailureOr<mlir::ktdp::ConstructAccessTilesOp> rebuildAccessTilePinned(
+    mlir::ktdp::ConstructAccessTilesOp at, unsigned pin_dim, mlir::Value new_iv,
+    mlir::Location loc, mlir::MLIRContext* ctx) {
   mlir::IntegerSet old_set = at.getAccessTileSet().getValue();
   unsigned num_dims = old_set.getNumDims();
-  assert(pin_dim < num_dims && "pin_dim out of range for access_tile_set");
+  if (pin_dim >= num_dims) {
+    at.emitError() << "access tile rank (" << num_dims
+                   << ") has no remaining dimension to pin (pin_dim="
+                   << pin_dim << ")";
+    return mlir::failure();
+  }
 
   mlir::IntegerSet new_set = pinDimInIntegerSet(old_set, pin_dim);
 
@@ -142,18 +144,21 @@ mlir::ktdp::ConstructAccessTilesOp rebuildAccessTilePinned(
   // Result shape: dim pin_dim becomes 1, all others unchanged.
   auto old_type =
       mlir::cast<mlir::ktdp::AccessTileType>(at.getResult().getType());
-  llvm::SmallVector<int64_t> new_shape(old_type.getShape().begin(),
-                                       old_type.getShape().end());
+  llvm::ArrayRef<int64_t> old_shape = old_type.getShape();
+  llvm::SmallVector<int64_t> new_shape(old_shape.begin(), old_shape.end());
   new_shape[pin_dim] = 1;
   auto new_type =
       mlir::ktdp::AccessTileType::get(new_shape, old_type.getElementType());
 
-  // Subscripts: one IV per pinned dim 0..pin_dim, %c0 for the free dims above.
+  // Subscripts: at's own indices for the already-pinned prefix 0..pin_dim-1,
+  // new_iv at pin_dim, %c0 for the free dims above.
   mlir::OpBuilder builder(at);
   mlir::Value c0 =
       mlir::arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+  mlir::OperandRange old_indices = at.getIndices();
   llvm::SmallVector<mlir::Value> new_indices(num_dims, c0);
-  for (unsigned d = 0; d <= pin_dim; ++d) new_indices[d] = window_ivs[d];
+  for (unsigned d = 0; d < pin_dim; ++d) new_indices[d] = old_indices[d];
+  new_indices[pin_dim] = new_iv;
 
   return mlir::ktdp::ConstructAccessTilesOp::create(
       builder, at.getLoc(), new_type, at.getBase(), new_base_map, new_indices,
@@ -240,10 +245,53 @@ std::pair<mlir::Operation*, mlir::Operation*> computeSpliceBoundary(
   return {splice_begin_op, splice_end_op};
 }
 
-std::optional<DeferredExpand> pinDestAccessTile(
+namespace {
+
+/// Result of pinning one more dimension of a destination/source access tile:
+/// the rebuilt op, its shape, how many leading dims are now pinned
+/// (including the one just pinned), and the reassociation that folds that
+/// prefix into a single dim — shared by pinDestAccessTile's deferred
+/// expand_shape and pinSourceAccessTile's immediate collapse_shape.
+struct PinnedAccessTile {
+  mlir::ktdp::ConstructAccessTilesOp at;
+  llvm::ArrayRef<int64_t> shape;
+  unsigned pinned_dims;
+  mlir::SmallVector<mlir::ReassociationIndices> reassoc;
+};
+
+/// Derives the dimension to pin from @p at's own shape (see
+/// rebuildAccessTilePinned), pins it, and computes the fold that restores or
+/// collapses the now-pinned leading prefix against the tensor-space value it
+/// corresponds to.
+mlir::FailureOr<PinnedAccessTile> pinAndFoldAccessTile(
+    mlir::ktdp::ConstructAccessTilesOp at, mlir::Value new_iv,
+    mlir::Location loc, mlir::MLIRContext* ctx) {
+  llvm::ArrayRef<int64_t> old_shape =
+      mlir::cast<mlir::ktdp::AccessTileType>(at.getResult().getType())
+          .getShape();
+  unsigned pin_dim = 0;
+  while (pin_dim < old_shape.size() && old_shape[pin_dim] == 1) ++pin_dim;
+
+  auto new_at_or_failure =
+      rebuildAccessTilePinned(at, pin_dim, new_iv, loc, ctx);
+  if (mlir::failed(new_at_or_failure)) return mlir::failure();
+  mlir::ktdp::ConstructAccessTilesOp new_at = *new_at_or_failure;
+
+  llvm::ArrayRef<int64_t> new_shape =
+      mlir::cast<mlir::ktdp::AccessTileType>(new_at.getResult().getType())
+          .getShape();
+  unsigned pinned_dims = pin_dim + 1;
+  auto reassoc = makeLeadingFoldReassociation(
+      static_cast<unsigned>(new_shape.size()), pinned_dims);
+
+  return PinnedAccessTile{new_at, new_shape, pinned_dims, reassoc};
+}
+
+}  // namespace
+
+mlir::FailureOr<std::optional<DeferredExpand>> pinDestAccessTile(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp current_op,
-    mlir::Block* scope_block, unsigned pin_dim,
-    llvm::ArrayRef<mlir::Value> window_ivs,
+    mlir::Block* scope_block, mlir::Value new_iv,
     llvm::SmallVectorImpl<mlir::Operation*>& pre_narrowed, mlir::Location loc,
     mlir::MLIRContext* ctx) {
   std::optional<DeferredExpand> result;
@@ -269,33 +317,27 @@ std::optional<DeferredExpand> pinDestAccessTile(
           prior_expand.erase();
         }
 
-        auto new_out_at =
-            rebuildAccessTilePinned(out_at, pin_dim, window_ivs, loc, ctx);
-        pre_narrowed.push_back(new_out_at.getOperation());
-        llvm::ArrayRef<int64_t> new_out_shape =
-            mlir::cast<mlir::ktdp::AccessTileType>(
-                new_out_at.getResult().getType())
-                .getShape();
-
-        auto out_reassoc = makeLeadingFoldReassociation(
-            static_cast<unsigned>(new_out_shape.size()),
-            /*folded_leading_dims=*/pin_dim + 1);
+        auto pinned = pinAndFoldAccessTile(out_at, new_iv, loc, ctx);
+        if (mlir::failed(pinned)) return mlir::failure();
+        pre_narrowed.push_back(pinned->at.getOperation());
 
         mlir::Type out_elem_type = mlir::cast<mlir::RankedTensorType>(
                                        out_store.getDataTile().getType())
                                        .getElementType();
 
+        // Deferred: restores the now-pinned leading prefix once
+        // propagateNarrowing has drop-narrowed the compute result.
         DeferredExpand deferred;
         deferred.src_val = out_store.getDataTile();
         deferred.store = out_store;
-        deferred.reassoc = out_reassoc;
+        deferred.reassoc = pinned->reassoc;
         deferred.pinned_type =
-            mlir::RankedTensorType::get(new_out_shape, out_elem_type);
+            mlir::RankedTensorType::get(pinned->shape, out_elem_type);
         result = deferred;
 
         pre_narrowed.push_back(out_store.getOperation());
 
-        out_at.getResult().replaceAllUsesWith(new_out_at.getResult());
+        out_at.getResult().replaceAllUsesWith(pinned->at.getResult());
         out_at.erase();
         continue;
       }
@@ -311,10 +353,9 @@ std::optional<DeferredExpand> pinDestAccessTile(
   return result;
 }
 
-void pinSourceAccessTile(
+mlir::LogicalResult pinSourceAccessTile(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp current_op,
-    mlir::Block* scope_block, unsigned pin_dim,
-    llvm::ArrayRef<mlir::Value> window_ivs,
+    mlir::Block* scope_block, mlir::Value new_iv,
     llvm::SmallVectorImpl<mlir::Operation*>& pre_narrowed, mlir::Location loc,
     mlir::MLIRContext* ctx) {
   for (mlir::Operation* user : current_op.getResult().getUsers()) {
@@ -334,13 +375,9 @@ void pinSourceAccessTile(
             mlir::dyn_cast_if_present<mlir::ktdp::ConstructAccessTilesOp>(
                 src_load.getAccessTile().getDefiningOp());
         if (src_at) {
-          auto new_src_at =
-              rebuildAccessTilePinned(src_at, pin_dim, window_ivs, loc, ctx);
-          pre_narrowed.push_back(new_src_at.getOperation());
-          llvm::ArrayRef<int64_t> new_src_shape =
-              mlir::cast<mlir::ktdp::AccessTileType>(
-                  new_src_at.getResult().getType())
-                  .getShape();
+          auto pinned = pinAndFoldAccessTile(src_at, new_iv, loc, ctx);
+          if (mlir::failed(pinned)) return mlir::failure();
+          pre_narrowed.push_back(pinned->at.getOperation());
 
           mlir::Type src_elem_type =
               mlir::cast<mlir::RankedTensorType>(src_load.getResult().getType())
@@ -348,19 +385,18 @@ void pinSourceAccessTile(
 
           mlir::OpBuilder sl_b(src_load);
           auto new_src_load = mlir::ktdp::LoadOp::create(
-              sl_b, src_load.getLoc(), new_src_at.getResult(), src_elem_type);
+              sl_b, src_load.getLoc(), pinned->at.getResult(), src_elem_type);
           pre_narrowed.push_back(new_src_load.getOperation());
 
-          unsigned src_pinned_dims = pin_dim + 1;
-          auto src_reassoc = makeLeadingFoldReassociation(
-              static_cast<unsigned>(new_src_shape.size()), src_pinned_dims);
+          // Immediate: the collapse must be in place before propagateNarrowing
+          // narrows the generic that consumes it.
           auto src_collapsed_type = mlir::RankedTensorType::get(
-              new_src_shape.drop_front(src_pinned_dims), src_elem_type);
+              pinned->shape.drop_front(pinned->pinned_dims), src_elem_type);
 
           mlir::OpBuilder cs_src_b(src_load->getNextNode());
           auto new_src_collapse = mlir::tensor::CollapseShapeOp::create(
               cs_src_b, src_load.getLoc(), src_collapsed_type,
-              new_src_load.getResult(), src_reassoc);
+              new_src_load.getResult(), pinned->reassoc);
           pre_narrowed.push_back(new_src_collapse.getOperation());
 
           for (mlir::OpOperand& load_use :
@@ -376,7 +412,7 @@ void pinSourceAccessTile(
           }
 
           src_load.erase();
-          src_at.getResult().replaceAllUsesWith(new_src_at.getResult());
+          src_at.getResult().replaceAllUsesWith(pinned->at.getResult());
           src_at.erase();
         }
         continue;
@@ -390,6 +426,7 @@ void pinSourceAccessTile(
       }
     }
   }
+  return mlir::success();
 }
 
 namespace {

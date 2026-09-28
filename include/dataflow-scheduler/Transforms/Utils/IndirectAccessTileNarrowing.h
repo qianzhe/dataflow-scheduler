@@ -143,24 +143,30 @@ mlir::SmallVector<mlir::ReassociationIndices> makeLeadingFoldReassociation(
 /// dropping a dim there would break the ConstructAccessTilesOp invariant
 /// `access_tile_set.numDims == base_map.numInputs == base memref rank`.
 ///
-/// Dims `0..pin_dim-1` were pinned by earlier iterations and take their own
-/// IV as subscript; dims above @p pin_dim take %c0.
+/// The subscripts for dims pinned by earlier calls (0..pin_dim-1) are
+/// recovered from @p at's own current indices — this function set them on
+/// every prior pin, so the caller need not track or pass them itself; dims
+/// above @p pin_dim take %c0.
 ///
 /// The caller owns the old op: this only inserts the replacement at @p at's
 /// position (along with the %c0 it needs) and returns it.
 ///
-/// @param at         The access tile op to rebuild.
-/// @param pin_dim    Index of the dimension to pin; must equal
-///                   `window_ivs.size() - 1`.
-/// @param window_ivs IVs of all loops materialised so far, current
-///                   (innermost) one last.
-/// @param loc        Location for newly-inserted ops.
-/// @param ctx        MLIR context.
-/// @returns The rebuilt, pinned access tile op.
-mlir::ktdp::ConstructAccessTilesOp rebuildAccessTilePinned(
-    mlir::ktdp::ConstructAccessTilesOp at, unsigned pin_dim,
-    llvm::ArrayRef<mlir::Value> window_ivs, mlir::Location loc,
-    mlir::MLIRContext* ctx);
+/// @param at      The access tile op to rebuild.
+/// @param pin_dim Index of the dimension this call pins. Callers typically
+///                derive this as the length of the leading run of extent-1
+///                dims in @p at's shape (the prefix already pinned by
+///                earlier calls), so it lines up with whatever they also
+///                need that run's length for (e.g. sizing a fold).
+/// @param new_iv  Loop IV for the dimension this call pins.
+/// @param loc     Location for newly-inserted ops.
+/// @param ctx     MLIR context.
+/// @returns The rebuilt, pinned access tile op, or failure (with a
+///          diagnostic on @p at) if @p pin_dim is not a valid dimension of
+///          @p at — the caller's signal that @p at's rank does not match how
+///          many dimensions it still expected to absorb.
+mlir::FailureOr<mlir::ktdp::ConstructAccessTilesOp> rebuildAccessTilePinned(
+    mlir::ktdp::ConstructAccessTilesOp at, unsigned pin_dim, mlir::Value new_iv,
+    mlir::Location loc, mlir::MLIRContext* ctx);
 
 /// Collect all ops in an indirect op's block that must move into a new loop
 /// body wrapping it.
@@ -226,24 +232,22 @@ struct DeferredExpand {
 ///
 /// @param current_op   The indirect access tile op just narrowed.
 /// @param scope_block  Block searched for a matching output store.
-/// @param pin_dim      Dimension to pin; must be `window_ivs.size() - 1`
-///                     (see rebuildAccessTilePinned()).
-/// @param window_ivs   IVs of all loops materialised so far, current
-///                     (innermost) one last.
+/// @param new_iv       Loop IV for the dimension this call pins (see
+///                     rebuildAccessTilePinned()).
 /// @param pre_narrowed Ops already rebuilt by this call, appended so a
 ///                     later propagateNarrowing() walk skips re-mutating
 ///                     them.
 /// @param loc          Location for newly-inserted ops.
 /// @param ctx          MLIR context.
-/// @returns State to be used by the caller, after propagateNarrowing has
-///          run, to insert a fresh tensor.expand_shape restoring the pinned
-///          shape and rewire the store to it. std::nullopt when
-///          @p current_op is not an indirect load, or no matching output
-///          store is found in scope.
-std::optional<DeferredExpand> pinDestAccessTile(
+/// @returns Failure if rebuildAccessTilePinned() fails on the discovered
+///          access tile. Otherwise, state to be used by the caller, after
+///          propagateNarrowing has run, to insert a fresh
+///          tensor.expand_shape restoring the pinned shape and rewire the
+///          store to it — std::nullopt when @p current_op is not an
+///          indirect load, or no matching output store is found in scope.
+mlir::FailureOr<std::optional<DeferredExpand>> pinDestAccessTile(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp current_op,
-    mlir::Block* scope_block, unsigned pin_dim,
-    llvm::ArrayRef<mlir::Value> window_ivs,
+    mlir::Block* scope_block, mlir::Value new_iv,
     llvm::SmallVectorImpl<mlir::Operation*>& pre_narrowed, mlir::Location loc,
     mlir::MLIRContext* ctx);
 
@@ -256,18 +260,19 @@ std::optional<DeferredExpand> pinDestAccessTile(
 ///
 /// @param current_op   The indirect access tile op just narrowed.
 /// @param scope_block  Block searched for a matching source-access-tile load.
-/// @param pin_dim      Dimension to pin (see rebuildAccessTilePinned()).
-/// @param window_ivs   IVs of all loops materialised so far, current
-///                     (innermost) one last.
+/// @param new_iv       Loop IV for the dimension this call pins (see
+///                     rebuildAccessTilePinned()).
 /// @param pre_narrowed Ops already rebuilt by this call, appended so a
 ///                     later propagateNarrowing() walk skips re-mutating
 ///                     them.
 /// @param loc          Location for newly-inserted ops.
 /// @param ctx          MLIR context.
-void pinSourceAccessTile(
+/// @returns Failure if rebuildAccessTilePinned() fails on a discovered
+///          source access tile; success otherwise (including when no
+///          matching source-access-tile load is found in scope).
+mlir::LogicalResult pinSourceAccessTile(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp current_op,
-    mlir::Block* scope_block, unsigned pin_dim,
-    llvm::ArrayRef<mlir::Value> window_ivs,
+    mlir::Block* scope_block, mlir::Value new_iv,
     llvm::SmallVectorImpl<mlir::Operation*>& pre_narrowed, mlir::Location loc,
     mlir::MLIRContext* ctx);
 

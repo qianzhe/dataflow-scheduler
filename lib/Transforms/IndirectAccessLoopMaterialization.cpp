@@ -112,7 +112,7 @@ mlir::LogicalResult classifyDirectVariables(
   for (unsigned i = 0; i < num_interm; ++i) {
     unsigned target_unified_dim = num_captured + i;
 
-    int found_k = -1;
+    std::optional<unsigned> found_k;
     for (unsigned k = 0; k < base_rank; ++k) {
       auto map = mlir::cast<mlir::AffineMapAttr>(per_dim_maps[k]).getValue();
       if (map.getNumResults() != 1) {
@@ -121,24 +121,23 @@ mlir::LogicalResult classifyDirectVariables(
         return mlir::failure();
       }
       if (map.getResult(0).isFunctionOfDim(target_unified_dim)) {
-        if (found_k >= 0) {
+        if (found_k.has_value()) {
           op.emitError() << "intermediate variable " << i
                          << " is referenced by more than one "
                             "per_dim_subscript_maps entry";
           return mlir::failure();
         }
-        found_k = static_cast<int>(k);
+        found_k = k;
       }
     }
-    if (found_k < 0) {
+    if (!found_k) {
       op.emitError() << "intermediate variable " << i
                      << " is not referenced by any per_dim_subscript_maps "
                         "entry";
       return mlir::failure();
     }
-    unsigned k = static_cast<unsigned>(found_k);
 
-    auto trip_count = getTripCount(vars_set, i);
+    std::optional<int64_t> trip_count = getTripCount(vars_set, i);
     if (!trip_count) {
       op.emitError() << "could not extract constant trip count for "
                         "intermediate variable "
@@ -147,13 +146,14 @@ mlir::LogicalResult classifyDirectVariables(
     }
 
     bool dense_packed =
-        (k == base_rank - 1)
-            ? (base_strides[k] == 1)
-            : (base_strides[k] == base_sizes[k + 1] * base_strides[k + 1]);
-    bool full_coverage = (*trip_count == base_sizes[k]);
+        (*found_k == base_rank - 1)
+            ? (base_strides[*found_k] == 1)
+            : (base_strides[*found_k] ==
+               base_sizes[*found_k + 1] * base_strides[*found_k + 1]);
+    bool full_coverage = (*trip_count == base_sizes[*found_k]);
 
-    DirectVarInfo info{i, k, *trip_count};
-    LDBG(1) << "  interm_idx=" << i << " -> base_dim=" << k
+    DirectVarInfo info{i, *found_k, *trip_count};
+    LDBG(1) << "  interm_idx=" << i << " -> base_dim=" << *found_k
             << " trip_count=" << *trip_count << " dense_packed=" << dense_packed
             << " full_coverage=" << full_coverage << " -> "
             << (dense_packed && full_coverage ? "retained" : "loop_var");
@@ -169,109 +169,6 @@ mlir::LogicalResult classifyDirectVariables(
   LDBG(1) << "classifyDirectVariables: " << loop_vars.size() << " loop var(s), "
           << retained_vars.size() << " retained var(s)";
   return mlir::success();
-}
-
-/// Snapshot of the source/destination access tile's current state,
-/// read (never mutated) before this pass's own loop starts.
-struct AccessTilePeek {
-  unsigned rank;
-  // Indices for exactly the leading dims already pinned (extent-1) by a
-  // prior pass; does NOT include not-yet-pinned (still full-extent) dims,
-  // which must stay defaulted to a zero index by rebuildAccessTilePinned
-  // until this pass actually reaches them.
-  llvm::SmallVector<mlir::Value> pinned_prefix_indices;
-};
-
-/// Read-only mirror of pinDestAccessTile/pinSourceAccessTile's
-/// discovery walk: locates the destination access tile (indirect load
-/// / gather case, discovered downstream of `op`'s result) or the source
-/// access tile (indirect store / scatter case, discovered
-/// upstream of the store that writes into `op`'s result), without rebuilding
-/// anything. Used once, before this pass's own loop, to recover how many
-/// access tile dimensions IndirectAddrBufLegalization already pinned (and
-/// their subscripts), so this pass can continue the same monotonic
-/// dimension numbering without needing to re-derive
-/// IndirectAddrBufLegalization's window/entry induction variables from
-/// scratch. The already-pinned leading dims are identified by extent == 1
-/// in the discovered tile's own shape (set explicitly by
-/// rebuildAccessTilePinned on every prior pin), not by inspecting
-/// access_tile_set constraint forms.
-std::optional<AccessTilePeek> peekAccessTile(
-    mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
-    mlir::Block* scope_block, bool is_indirect_load) {
-  LDBG(1) << "peekAccessTile: op at " << op.getLoc()
-          << " is_indirect_load=" << is_indirect_load;
-  mlir::ktdp::ConstructAccessTilesOp found;
-
-  if (is_indirect_load) {
-    llvm::SmallVector<mlir::Value> worklist{op.getResult()};
-    llvm::DenseSet<mlir::Value> visited{op.getResult()};
-    while (!worklist.empty() && !found) {
-      mlir::Value cur_val = worklist.pop_back_val();
-      for (mlir::Operation* user : cur_val.getUsers()) {
-        if (user->getBlock() != scope_block) continue;
-        if (auto store = mlir::dyn_cast<mlir::ktdp::StoreOp>(user)) {
-          found = mlir::dyn_cast_if_present<mlir::ktdp::ConstructAccessTilesOp>(
-              store.getAccessTile().getDefiningOp());
-          if (found) break;
-          continue;
-        }
-        for (mlir::Value res : user->getResults()) {
-          if (mlir::isa<mlir::ktdp::AccessTileType, mlir::RankedTensorType>(
-                  res.getType()) &&
-              visited.insert(res).second)
-            worklist.push_back(res);
-        }
-      }
-    }
-  } else {
-    for (mlir::Operation* user : op.getResult().getUsers()) {
-      auto store = mlir::dyn_cast<mlir::ktdp::StoreOp>(user);
-      if (!store || store->getBlock() != scope_block) continue;
-
-      llvm::SmallVector<mlir::Value> worklist{store.getDataTile()};
-      llvm::DenseSet<mlir::Value> visited{store.getDataTile()};
-      while (!worklist.empty() && !found) {
-        mlir::Value cur_val = worklist.pop_back_val();
-        mlir::Operation* def = cur_val.getDefiningOp();
-        if (!def || def->getBlock() != scope_block) continue;
-
-        if (auto load = mlir::dyn_cast<mlir::ktdp::LoadOp>(def)) {
-          found = mlir::dyn_cast_if_present<mlir::ktdp::ConstructAccessTilesOp>(
-              load.getAccessTile().getDefiningOp());
-          continue;
-        }
-        for (mlir::Value operand : def->getOperands()) {
-          if (mlir::isa<mlir::ktdp::AccessTileType, mlir::RankedTensorType>(
-                  operand.getType()) &&
-              visited.insert(operand).second)
-            worklist.push_back(operand);
-        }
-      }
-      if (found) break;
-    }
-  }
-
-  if (!found) {
-    LDBG(1) << "  no source/destination access tile found";
-    return std::nullopt;
-  }
-  AccessTilePeek peek;
-  auto ty = mlir::cast<mlir::ktdp::AccessTileType>(found.getResult().getType());
-  llvm::ArrayRef<int64_t> shape = ty.getShape();
-  peek.rank = static_cast<unsigned>(shape.size());
-
-  unsigned pinned_prefix = 0;
-  while (pinned_prefix < shape.size() && shape[pinned_prefix] == 1)
-    ++pinned_prefix;
-
-  mlir::OperandRange indices = found.getIndices();
-  peek.pinned_prefix_indices.assign(indices.begin(),
-                                    indices.begin() + pinned_prefix);
-  LDBG(1) << "  found access tile at " << found.getLoc()
-          << " rank=" << peek.rank
-          << " already-pinned prefix=" << pinned_prefix;
-  return peek;
 }
 
 /// Finds the `Kind` co-located with `iab_kind` (i.e. sharing the same nearest
@@ -385,10 +282,12 @@ mlir::LogicalResult checkMinimumTransferSize(
 /// Materialize one scf.for per direct-subscript intermediate variable of
 /// `op` that cannot be serviced by a single hardware indirect transfer,
 /// outermost-$base-dimension-first. No-op (returns success without changes)
-/// when every remaining variable is retainable.
+/// when every remaining variable is retainable. `enforce_minimum_transfer_size`
+/// controls whether the retained region is validated against the hardware's
+/// minimum transfer size before materialization.
 mlir::LogicalResult materializeDirectAccessLoops(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
-    const TransferSizeInfo& transfer_info) {
+    const TransferSizeInfo& transfer_info, bool enforce_minimum_transfer_size) {
   mlir::MLIRContext* ctx = op.getContext();
   mlir::Location loc = op.getLoc();
 
@@ -432,7 +331,8 @@ mlir::LogicalResult materializeDirectAccessLoops(
 
   int64_t retained_count = 1;
   for (const DirectVarInfo& r : retained_vars) retained_count *= r.trip_count;
-  if (mlir::failed(checkMinimumTransferSize(op, base_mv, retained_count,
+  if (enforce_minimum_transfer_size &&
+      mlir::failed(checkMinimumTransferSize(op, base_mv, retained_count,
                                             is_indirect_load, is_indirect_store,
                                             transfer_info)))
     return mlir::failure();
@@ -455,30 +355,13 @@ mlir::LogicalResult materializeDirectAccessLoops(
   // ── Step 4: materialize, outermost-$base-dimension-first ───────────────
   mlir::ktdp_lowering::ConstructIndirectAccessTileOp current_op = op;
 
-  // Seed window_ivs/pin_dim from whatever IndirectAddrBufLegalization
-  // already pinned on the source/destination's own access tile (read-only
-  // peek; see peekAccessTile above).
-  llvm::SmallVector<mlir::Value> window_ivs;
-  if (auto peek = peekAccessTile(current_op, current_op->getBlock(),
-                                 is_indirect_load)) {
-    window_ivs.assign(peek->pinned_prefix_indices.begin(),
-                      peek->pinned_prefix_indices.end());
-    if (peek->rank !=
-        window_ivs.size() + loop_vars.size() + retained_vars.size()) {
-      current_op.emitError()
-          << "source/destination access tile rank (" << peek->rank
-          << ") does not match already-pinned dims (" << window_ivs.size()
-          << ") plus loop/retained variable count ("
-          << loop_vars.size() + retained_vars.size() << ")";
-      return mlir::failure();
-    }
-  }
-  unsigned pin_dim_base = static_cast<unsigned>(window_ivs.size());
-
-  LDBG(1) << "materializeDirectAccessLoops: seeded " << window_ivs.size()
-          << " already-pinned window iv(s), pin_dim_base=" << pin_dim_base
-          << " is_indirect_load=" << is_indirect_load
-          << " is_indirect_store=" << is_indirect_store;
+  // pinDestAccessTile/pinSourceAccessTile recover the destination/source
+  // access tile's already-pinned prefix from its own state on every call,
+  // and fail with a diagnostic (via rebuildAccessTilePinned) if that tile's
+  // rank has no remaining dimension left to pin — so no upfront rank check
+  // or running pin-dim count needs to be maintained here.
+  LDBG(1) << "materializeDirectAccessLoops: is_indirect_load="
+          << is_indirect_load << " is_indirect_store=" << is_indirect_store;
 
   for (unsigned m = 0; m < loop_vars.size(); ++m) {
     unsigned target_base_dim = loop_vars[m].base_dim;
@@ -589,21 +472,21 @@ mlir::LogicalResult materializeDirectAccessLoops(
             << " (enclosing loop at " << enclosing_for.getLoc() << ")";
 
     // ── Access Tile pin-dim continuation ────────────────────────────────
-    window_ivs.push_back(i_m);
-    unsigned pin_dim = pin_dim_base + m;
-
     llvm::SmallVector<mlir::Operation*> pre_narrowed;
     std::optional<DeferredExpand> deferred_out;
     if (is_indirect_load) {
-      deferred_out = pinDestAccessTile(current_op, scope_block, pin_dim,
-                                       window_ivs, pre_narrowed, loc, ctx);
+      auto pin_result =
+          pinDestAccessTile(current_op, scope_block, i_m, pre_narrowed, loc, ctx);
+      if (mlir::failed(pin_result)) return mlir::failure();
+      deferred_out = *pin_result;
     }
     if (is_indirect_store) {
-      pinSourceAccessTile(current_op, scope_block, pin_dim, window_ivs,
-                          pre_narrowed, loc, ctx);
+      if (mlir::failed(pinSourceAccessTile(current_op, scope_block, i_m,
+                                           pre_narrowed, loc, ctx)))
+        return mlir::failure();
     }
 
-    LDBG(1) << "  pinned access tile dim=" << pin_dim << ", "
+    LDBG(1) << "  pinned access tile for loop var m=" << m << ", "
             << pre_narrowed.size() << " op(s) pre-narrowed";
 
     // ── Rebuild construct_indirect_access_tile ────────────────────────────
@@ -711,32 +594,43 @@ struct IndirectAccessLoopMaterializationPass
 
     LDBG(1) << "===== " PASS_NAME " =====";
 
-    llvm::SmallVector<mlir::ktdp_lowering::ConstructIndirectAccessTileOp, 4>
-        indirect_ops;
+    using FuncAndIndirectOp =
+        std::pair<mlir::func::FuncOp,
+                  mlir::ktdp_lowering::ConstructIndirectAccessTileOp>;
+    llvm::SmallVector<FuncAndIndirectOp, 4> indirect_ops;
 
-    for (auto func : module.getOps<mlir::func::FuncOp>()) {
-      mlir::ktdp_lowering::ConstructIndirectAccessTileOp func_indirect_op;
-      mlir::WalkResult walk_res =
-          func.walk([&](mlir::ktdp_lowering::ConstructIndirectAccessTileOp op) {
-            if (func_indirect_op) {
-              op->emitError(
-                  "multiple construct_indirect_access_tile ops in the same "
-                  "func.func are not supported");
-              return mlir::WalkResult::interrupt();
-            }
-            func_indirect_op = op;
-            return mlir::WalkResult::advance();
-          });
-
-      if (walk_res.wasInterrupted()) {
-        signalPassFailure();
-        return;
-      }
-      if (func_indirect_op) indirect_ops.push_back(func_indirect_op);
+    // Walk the entire module to find all non-external func.funcs regardless of
+    // nesting depth (direct children, inside child modules, etc.).
+    unsigned num_funcs = 0;
+    mlir::WalkResult outer_walk =
+        module.walk([&](mlir::func::FuncOp func) -> mlir::WalkResult {
+          if (func.isExternal()) return mlir::WalkResult::advance();
+          ++num_funcs;
+          mlir::ktdp_lowering::ConstructIndirectAccessTileOp func_indirect_op;
+          mlir::WalkResult walk_res = func.walk(
+              [&](mlir::ktdp_lowering::ConstructIndirectAccessTileOp op) {
+                if (func_indirect_op) {
+                  op->emitError(
+                      "multiple construct_indirect_access_tile ops in the same "
+                      "func.func are not supported");
+                  return mlir::WalkResult::interrupt();
+                }
+                func_indirect_op = op;
+                return mlir::WalkResult::advance();
+              });
+          if (walk_res.wasInterrupted()) return mlir::WalkResult::interrupt();
+          if (func_indirect_op)
+            indirect_ops.push_back({func, func_indirect_op});
+          return mlir::WalkResult::advance();
+        });
+    if (outer_walk.wasInterrupted()) {
+      signalPassFailure();
+      return;
     }
 
     LDBG(1) << "found " << indirect_ops.size()
-            << " construct_indirect_access_tile op(s)";
+            << " construct_indirect_access_tile op(s) across " << num_funcs
+            << " func.func(s)";
 
     // No-op: return early when no indirect access tiles are present.
     if (indirect_ops.empty()) return;
@@ -746,21 +640,17 @@ struct IndirectAccessLoopMaterializationPass
     // capacity (num_entries) is not needed by this pass at all; that's a
     // separate resource property used for window sizing by
     // IndirectAddrBufLegalization.
-    auto declaration =
-        mlir::ktdf_arch::findDeviceDeclarationFor(indirect_ops.front());
-    if (!declaration) {
-      indirect_ops.front()->emitError(
-          "could not find device declaration for indirect access loop "
-          "materialization");
+    auto& device_manager = getAnalysis<mlir::ktdf_arch::DeviceManager>();
+    auto* const device = device_manager.getOrImportDevice();
+    if (!device) {
+      module->emitError(
+          "Unable to import the device specification. This could happen if "
+          "the device spec file is empty or contains multiple devices");
       signalPassFailure();
       return;
     }
-    mlir::ktdf_arch::DeviceRef device(declaration, getAnalysisManager());
-
-    LDBG(1) << "found device declaration at " << declaration->getLoc();
-
     auto& resource_kinds =
-        device.getOrCreateView<mlir::ktdf_arch::ResourceKinds>();
+        device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
     mlir::ktdf_arch::ResourceKinds::Kind iab_kind;
     for (const mlir::ktdf_arch::ResourceKinds::Kind& kind : resource_kinds) {
@@ -772,7 +662,7 @@ struct IndirectAccessLoopMaterializationPass
       }
     }
     if (!iab_kind) {
-      declaration->emitWarning(
+      module->emitWarning(
           "device has no indirect address buffer resource; skipping "
           "indirect access loop materialization");
       return;
@@ -788,9 +678,8 @@ struct IndirectAccessLoopMaterializationPass
         resource_kinds, iab_kind);
 
     llvm::DenseMap<mlir::Attribute, mlir::Attribute> mem_space_map;
-    if (const auto mapping =
-            device.get().getAttrOfType<mlir::ktdf_arch::MapAttr>(
-                "mem_space_mapping");
+    if (const auto mapping = device->getAttrOfType<mlir::ktdf_arch::MapAttr>(
+            "mem_space_mapping");
         mapping) {
       mem_space_map.insert_range(mapping);
     }
@@ -803,17 +692,18 @@ struct IndirectAccessLoopMaterializationPass
             << static_cast<bool>(transfer_info.load_unit)
             << " store unit=" << static_cast<bool>(transfer_info.store_unit);
 
-    for (auto op : indirect_ops) {
+    for (auto& [func, op] : indirect_ops) {
       LDBG(1) << "materializing direct-access loops for "
                  "construct_indirect_access_tile at "
               << op.getLoc();
-      if (mlir::failed(materializeDirectAccessLoops(op, transfer_info))) {
+      if (mlir::failed(materializeDirectAccessLoops(
+              op, transfer_info, enforceMinimumTransferSize))) {
         LDBG(1) << "  materializeDirectAccessLoops FAILED";
         signalPassFailure();
         return;
       }
       LDBG(1) << "  materializeDirectAccessLoops succeeded";
-      LDBG(2) << "IR after materializeDirectAccessLoops:\n" << module;
+      LDBG(2) << "IR after materializeDirectAccessLoops:\n" << func;
     }
   }
 };

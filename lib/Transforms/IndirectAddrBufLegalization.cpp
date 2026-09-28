@@ -558,9 +558,11 @@ materializeWindowLoops(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
         // on iteration k dim k is *pinned* to one element rather than dropped,
         // giving shape [1, 32, ...] (dims 0..k-1 were already pinned by prior
         // iterations).  See rebuildAccessTilePinned.
-        auto new_addr_buf_at = rebuildAccessTilePinned(
-            link.addr_buf_at, /*pin_dim=*/static_cast<unsigned>(k), window_ivs,
-            loc, ctx);
+        auto new_addr_buf_at_or_failure = rebuildAccessTilePinned(
+            link.addr_buf_at, static_cast<unsigned>(k), window_ivs.back(), loc,
+            ctx);
+        if (mlir::failed(new_addr_buf_at_or_failure)) return mlir::failure();
+        auto new_addr_buf_at = *new_addr_buf_at_or_failure;
         pre_narrowed.push_back(new_addr_buf_at.getOperation());
         llvm::ArrayRef<int64_t> new_ab_shape =
             mlir::cast<mlir::ktdp::AccessTileType>(
@@ -652,16 +654,19 @@ materializeWindowLoops(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
     // expand left by a prior call (window iteration k-1) before doing so.
     std::optional<DeferredExpand> deferred_out;
     if (is_indirect_load) {
-      deferred_out = pinDestAccessTile(current_op, scope_block,
-                                       /*pin_dim=*/static_cast<unsigned>(k),
-                                       window_ivs, pre_narrowed, loc, ctx);
+      auto pin_result = pinDestAccessTile(current_op, scope_block,
+                                          window_ivs.back(), pre_narrowed, loc,
+                                          ctx);
+      if (mlir::failed(pin_result)) return mlir::failure();
+      deferred_out = *pin_result;
     }
 
     // ── Pin-not-drop for source access tiles (indirect store) ────────────
     if (is_indirect_store) {
-      pinSourceAccessTile(current_op, scope_block,
-                          /*pin_dim=*/static_cast<unsigned>(k), window_ivs,
-                          pre_narrowed, loc, ctx);
+      if (mlir::failed(pinSourceAccessTile(current_op, scope_block,
+                                           window_ivs.back(), pre_narrowed,
+                                           loc, ctx)))
+        return mlir::failure();
     }
 
     // Build the replacement op at the same position as current_op.
@@ -788,7 +793,6 @@ static mlir::LogicalResult materializeEntryLoop(
   llvm::SmallVector<mlir::Value> entry_ivs(window_ivs.begin(),
                                            window_ivs.end());
   entry_ivs.push_back(i2);
-  unsigned pin_dim = static_cast<unsigned>(window_ivs.size());
 
   mlir::Block* dst_block = for_op.getBody();
 
@@ -933,12 +937,15 @@ static mlir::LogicalResult materializeEntryLoop(
   llvm::SmallVector<mlir::Operation*> pre_narrowed;
   std::optional<DeferredExpand> deferred_out;
   if (is_indirect_load) {
-    deferred_out = pinDestAccessTile(current_op, dst_block, pin_dim, entry_ivs,
-                                     pre_narrowed, loc, ctx);
+    auto pin_result =
+        pinDestAccessTile(current_op, dst_block, i2, pre_narrowed, loc, ctx);
+    if (mlir::failed(pin_result)) return mlir::failure();
+    deferred_out = *pin_result;
   }
   if (is_indirect_store) {
-    pinSourceAccessTile(current_op, dst_block, pin_dim, entry_ivs, pre_narrowed,
-                        loc, ctx);
+    if (mlir::failed(
+            pinSourceAccessTile(current_op, dst_block, i2, pre_narrowed, loc, ctx)))
+      return mlir::failure();
   }
 
   // ── Rebuild construct_indirect_access_tile ──────────────────────────────
@@ -1065,8 +1072,10 @@ struct IndirectAddrBufLegalizationPass
 
     // Collect all construct_indirect_access_tile ops in each func.func,
     // enforcing that at most one indirect access tile exists per function.
-    llvm::SmallVector<mlir::ktdp_lowering::ConstructIndirectAccessTileOp, 4>
-        indirect_ops;
+    using FuncAndIndirectOp =
+        std::pair<mlir::func::FuncOp,
+                  mlir::ktdp_lowering::ConstructIndirectAccessTileOp>;
+    llvm::SmallVector<FuncAndIndirectOp, 4> indirect_ops;
 
     // Walk the entire module to find all non-external func.funcs regardless of
     // nesting depth (direct children, inside child modules, etc.).
@@ -1088,7 +1097,8 @@ struct IndirectAddrBufLegalizationPass
                 return mlir::WalkResult::advance();
               });
           if (walk_res.wasInterrupted()) return mlir::WalkResult::interrupt();
-          if (func_indirect_op) indirect_ops.push_back(func_indirect_op);
+          if (func_indirect_op)
+            indirect_ops.push_back({func, func_indirect_op});
           return mlir::WalkResult::advance();
         });
     if (outer_walk.wasInterrupted()) {
@@ -1104,21 +1114,17 @@ struct IndirectAddrBufLegalizationPass
     if (indirect_ops.empty()) return;
 
     // Query the hardware IAB size from the architecture specification.
-    auto declaration =
-        mlir::ktdf_arch::findDeviceDeclarationFor(indirect_ops.front());
-    if (!declaration) {
-      indirect_ops.front()->emitError(
-          "could not find device declaration for indirect address buffer "
-          "legalization");
+    auto& device_manager = getAnalysis<mlir::ktdf_arch::DeviceManager>();
+    auto* const device = device_manager.getOrImportDevice();
+    if (!device) {
+      module->emitError(
+          "Unable to import the device specification. This could happen if "
+          "the device spec file is empty or contains multiple devices");
       signalPassFailure();
       return;
     }
-    mlir::ktdf_arch::DeviceRef device(declaration, getAnalysisManager());
-
-    LDBG(1) << "found device declaration at " << declaration->getLoc();
-
     auto& resource_kinds =
-        device.getOrCreateView<mlir::ktdf_arch::ResourceKinds>();
+        device_manager.getOrCreateView<mlir::ktdf_arch::ResourceKinds>(*device);
 
     int64_t iab_size = -1;
     for (const mlir::ktdf_arch::ResourceKinds::Kind& kind : resource_kinds) {
@@ -1133,7 +1139,7 @@ struct IndirectAddrBufLegalizationPass
       }
     }
     if (iab_size < 0) {
-      declaration->emitWarning(
+      module->emitWarning(
           "device has no indirect address buffer resource with num_entries; "
           "skipping indirect address buffer legalization");
       return;
@@ -1141,7 +1147,7 @@ struct IndirectAddrBufLegalizationPass
 
     LDBG(1) << "hardware indirect address buffer size = " << iab_size;
 
-    for (auto op : indirect_ops) {
+    for (auto& [func, op] : indirect_ops) {
       LDBG(1) << "legalizing construct_indirect_access_tile at " << op.getLoc();
 
       auto win_result = materializeWindowLoops(op, iab_size);
@@ -1153,7 +1159,7 @@ struct IndirectAddrBufLegalizationPass
       LDBG(1) << "  materializeWindowLoops succeeded: emitted "
               << win_result->second.size() << " window loop(s), op now at "
               << win_result->first.getLoc();
-      LDBG(2) << "IR after materializeWindowLoops:\n" << module;
+      LDBG(2) << "IR after materializeWindowLoops:\n" << func;
 
       if (mlir::failed(materializeEntryLoop(win_result->first,
                                             win_result->second, iab_size))) {
@@ -1162,7 +1168,7 @@ struct IndirectAddrBufLegalizationPass
         return;
       }
       LDBG(1) << "  materializeEntryLoop succeeded";
-      LDBG(2) << "IR after materializeEntryLoop:\n" << module;
+      LDBG(2) << "IR after materializeEntryLoop:\n" << func;
     }
   }
 };

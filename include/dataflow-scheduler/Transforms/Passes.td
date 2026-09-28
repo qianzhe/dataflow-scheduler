@@ -587,6 +587,12 @@ def IndirectAccessLoopMaterializationPass
     "mlir::scf::SCFDialect",
     "mlir::ktdf::KTDFDialect"
   ];
+  let options = [
+    Option<"enforceMinimumTransferSize", "enforce-minimum-transfer-size", "bool",
+           /*default=*/"true",
+           "Fail if the retained region is smaller than the minimum hardware "
+           "transfer size">
+  ];
 }
 
 #endif // DATAFLOW_SCHEDULER_TRANSFORMS_PASSES_TD

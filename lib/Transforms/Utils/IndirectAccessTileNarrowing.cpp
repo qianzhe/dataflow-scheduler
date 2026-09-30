@@ -129,8 +129,8 @@ mlir::FailureOr<mlir::ktdp::ConstructAccessTilesOp> rebuildAccessTilePinned(
   unsigned num_dims = old_set.getNumDims();
   if (pin_dim >= num_dims) {
     at.emitError() << "access tile rank (" << num_dims
-                   << ") has no remaining dimension to pin (pin_dim="
-                   << pin_dim << ")";
+                   << ") has no remaining dimension to pin (pin_dim=" << pin_dim
+                   << ")";
     return mlir::failure();
   }
 

@@ -558,9 +558,9 @@ materializeWindowLoops(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
         // on iteration k dim k is *pinned* to one element rather than dropped,
         // giving shape [1, 32, ...] (dims 0..k-1 were already pinned by prior
         // iterations).  See rebuildAccessTilePinned.
-        auto new_addr_buf_at_or_failure = rebuildAccessTilePinned(
-            link.addr_buf_at, static_cast<unsigned>(k), window_ivs.back(), loc,
-            ctx);
+        auto new_addr_buf_at_or_failure =
+            rebuildAccessTilePinned(link.addr_buf_at, static_cast<unsigned>(k),
+                                    window_ivs.back(), loc, ctx);
         if (mlir::failed(new_addr_buf_at_or_failure)) return mlir::failure();
         auto new_addr_buf_at = *new_addr_buf_at_or_failure;
         pre_narrowed.push_back(new_addr_buf_at.getOperation());
@@ -654,9 +654,8 @@ materializeWindowLoops(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
     // expand left by a prior call (window iteration k-1) before doing so.
     std::optional<DeferredExpand> deferred_out;
     if (is_indirect_load) {
-      auto pin_result = pinDestAccessTile(current_op, scope_block,
-                                          window_ivs.back(), pre_narrowed, loc,
-                                          ctx);
+      auto pin_result = pinDestAccessTile(
+          current_op, scope_block, window_ivs.back(), pre_narrowed, loc, ctx);
       if (mlir::failed(pin_result)) return mlir::failure();
       deferred_out = *pin_result;
     }
@@ -664,8 +663,8 @@ materializeWindowLoops(mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
     // ── Pin-not-drop for source access tiles (indirect store) ────────────
     if (is_indirect_store) {
       if (mlir::failed(pinSourceAccessTile(current_op, scope_block,
-                                           window_ivs.back(), pre_narrowed,
-                                           loc, ctx)))
+                                           window_ivs.back(), pre_narrowed, loc,
+                                           ctx)))
         return mlir::failure();
     }
 
@@ -943,8 +942,8 @@ static mlir::LogicalResult materializeEntryLoop(
     deferred_out = *pin_result;
   }
   if (is_indirect_store) {
-    if (mlir::failed(
-            pinSourceAccessTile(current_op, dst_block, i2, pre_narrowed, loc, ctx)))
+    if (mlir::failed(pinSourceAccessTile(current_op, dst_block, i2,
+                                         pre_narrowed, loc, ctx)))
       return mlir::failure();
   }
 

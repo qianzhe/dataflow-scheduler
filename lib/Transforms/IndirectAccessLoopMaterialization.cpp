@@ -475,8 +475,8 @@ mlir::LogicalResult materializeDirectAccessLoops(
     llvm::SmallVector<mlir::Operation*> pre_narrowed;
     std::optional<DeferredExpand> deferred_out;
     if (is_indirect_load) {
-      auto pin_result =
-          pinDestAccessTile(current_op, scope_block, i_m, pre_narrowed, loc, ctx);
+      auto pin_result = pinDestAccessTile(current_op, scope_block, i_m,
+                                          pre_narrowed, loc, ctx);
       if (mlir::failed(pin_result)) return mlir::failure();
       deferred_out = *pin_result;
     }

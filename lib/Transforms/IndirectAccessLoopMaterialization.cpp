@@ -39,6 +39,7 @@
 #include "dataflow-scheduler/Transforms/Utils/IndirectAccessTileNarrowing.h"
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -60,6 +61,12 @@ namespace scheduler {
 #define GEN_PASS_DEF_INDIRECTACCESSLOOPMATERIALIZATIONPASS
 #include "dataflow-scheduler/Transforms/Passes.h.inc"
 }  // namespace scheduler
+
+static llvm::cl::opt<bool> EnforceMinimumTransferSize(
+    PASS_NAME "-enforce-minimum-transfer-size",
+    llvm::cl::desc("Fail if the retained region is smaller than the minimum "
+                   "hardware transfer size"),
+    llvm::cl::init(true));
 
 namespace {
 
@@ -282,12 +289,12 @@ mlir::LogicalResult checkMinimumTransferSize(
 /// Materialize one scf.for per direct-subscript intermediate variable of
 /// `op` that cannot be serviced by a single hardware indirect transfer,
 /// outermost-$base-dimension-first. No-op (returns success without changes)
-/// when every remaining variable is retainable. `enforce_minimum_transfer_size`
+/// when every remaining variable is retainable. `EnforceMinimumTransferSize`
 /// controls whether the retained region is validated against the hardware's
 /// minimum transfer size before materialization.
 mlir::LogicalResult materializeDirectAccessLoops(
     mlir::ktdp_lowering::ConstructIndirectAccessTileOp op,
-    const TransferSizeInfo& transfer_info, bool enforce_minimum_transfer_size) {
+    const TransferSizeInfo& transfer_info) {
   mlir::MLIRContext* ctx = op.getContext();
   mlir::Location loc = op.getLoc();
 
@@ -331,7 +338,7 @@ mlir::LogicalResult materializeDirectAccessLoops(
 
   int64_t retained_count = 1;
   for (const DirectVarInfo& r : retained_vars) retained_count *= r.trip_count;
-  if (enforce_minimum_transfer_size &&
+  if (EnforceMinimumTransferSize &&
       mlir::failed(checkMinimumTransferSize(op, base_mv, retained_count,
                                             is_indirect_load, is_indirect_store,
                                             transfer_info)))
@@ -696,8 +703,7 @@ struct IndirectAccessLoopMaterializationPass
       LDBG(1) << "materializing direct-access loops for "
                  "construct_indirect_access_tile at "
               << op.getLoc();
-      if (mlir::failed(materializeDirectAccessLoops(
-              op, transfer_info, enforceMinimumTransferSize))) {
+      if (mlir::failed(materializeDirectAccessLoops(op, transfer_info))) {
         LDBG(1) << "  materializeDirectAccessLoops FAILED";
         signalPassFailure();
         return;

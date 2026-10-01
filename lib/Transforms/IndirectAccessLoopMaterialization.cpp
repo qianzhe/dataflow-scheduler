@@ -63,7 +63,7 @@ namespace scheduler {
 }  // namespace scheduler
 
 static llvm::cl::opt<bool> EnforceMinimumTransferSize(
-    PASS_NAME "-enforce-minimum-transfer-size",
+    "enforce-minimum-ind-transfer-size",
     llvm::cl::desc("Fail if the retained region is smaller than the minimum "
                    "hardware transfer size"),
     llvm::cl::init(true));
